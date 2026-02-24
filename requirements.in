@@ -9,3 +9,4 @@ python-dotenv
 PyYAML
 requests
 tqdm
+pytest
