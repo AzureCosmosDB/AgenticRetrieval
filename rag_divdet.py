@@ -1011,8 +1011,7 @@ class CombinedRetriever:
                 doc = {k: v for k, v in r.items() if k != "score"}
             if not isinstance(doc, dict):
                 continue
-            score = r.get("score")
-            doc["_score"] = score if score is not None else 0
+            doc["_score"] = r.get("score")
             docs.append(doc)
         _ck(f"vector materialize x{len(docs)} ({container.id}) – done", t_reads)
         return docs
@@ -1027,7 +1026,7 @@ class CombinedRetriever:
         return RetrievedChunk(
             chunk_id=doc.get('id', ''),
             text="\n".join(parts),
-            similarity=(1 - doc.get('_score', 0)) if '_score' in doc else None,
+            similarity=1 - doc.get('_score', 0) if '_score' in doc else None,
             metadata={'_data_source': source, 'embedding': embedding}
         )
     
