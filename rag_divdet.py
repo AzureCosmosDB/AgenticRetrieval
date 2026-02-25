@@ -19,7 +19,7 @@ import yaml
 
 import openai
 from azure.cosmos.aio import CosmosClient
-from azure.identity.aio import DefaultAzureCredential
+from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential, DefaultAzureCredential
 from azure.identity import AzureCliCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
@@ -299,6 +299,8 @@ class LLMClient:
         llm_cfg = CONFIG["llm"]
         self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"])
         self._api_key = llm_cfg["azure_openai_key"]
+        _embed_key = str(llm_cfg.get("azure_embed_key", "") or "").strip()
+        self._embed_api_key = _embed_key if _embed_key else self._api_key
         self._token_provider = None
         if self._use_rbac_auth:
             token_scope = llm_cfg.get("token_scope")
@@ -335,8 +337,10 @@ class LLMClient:
             return [float(x) for x in embedding]
         values = [float(x) for x in embedding]
         if len(values) > self._embed_dimensions:
+            print(f"Warning: embedding dimension {len(values)} is larger than expected {self._embed_dimensions}; truncating")
             return values[:self._embed_dimensions]
         if len(values) < self._embed_dimensions:
+            print(f"Warning: embedding dimension {len(values)} is smaller than expected {self._embed_dimensions}; padding with zeros")
             return values + [0.0] * (self._embed_dimensions - len(values))
         return values
     
@@ -366,9 +370,9 @@ class LLMClient:
             if self._use_rbac_auth:
                 client_kwargs["azure_ad_token_provider"] = self._token_provider
             else:
-                if not self._api_key or not str(self._api_key).strip():
-                    raise ValueError("llm.azure_openai_key must be set when llm.use_rbac_auth is false")
-                client_kwargs["api_key"] = self._api_key
+                if not self._embed_api_key or not str(self._embed_api_key).strip():
+                    raise ValueError("llm.azure_embed_key (or llm.azure_openai_key) must be set when llm.use_rbac_auth is false")
+                client_kwargs["api_key"] = self._embed_api_key
             self._embed_client = AsyncAzureOpenAI(**client_kwargs)
         return self._embed_client
     
@@ -653,6 +657,7 @@ class LLMClient:
         try:
             premium_response = await self._complete_premium(prompt, retries, label)
         except openai.BadRequestError as e:
+            print(e)
             print(f"BadRequestError on {label}; using safe fallback response")
             premium_response = self._safe_fallback_response(label)
         except Exception:
@@ -826,10 +831,12 @@ class CombinedRetriever:
         k_diverse: int = 0,
         eta: float = 0.0,
         rescale_power: float = 0.0,
+        cosmos_az_login: bool = False,
     ):
         self.k_diverse = k_diverse
         self.eta = eta
         self.rescale_power = rescale_power
+        self._cosmos_az_login = cosmos_az_login
         self._cosmos = None
         self._db = None
         self._containers: dict[str, Any] = {}
@@ -888,7 +895,12 @@ class CombinedRetriever:
 
     async def initialize(self):
         use_rbac_auth = CONFIG.get("cosmos", {}).get("use_rbac_auth", False)
-        if use_rbac_auth:
+        if self._cosmos_az_login:
+            credential = AsyncAzureCliCredential()
+            self._credential = credential
+            print("✓ Using 'az login' (AzureCliCredential) authentication for Cosmos DB")
+            self._cosmos = CosmosClient(COSMOS_ENDPOINT, credential=credential) #, connection_mode="Direct")
+        elif use_rbac_auth:
             credential = DefaultAzureCredential()
             self._credential = credential
             print("✓ Using Entra ID RBAC authentication for Cosmos DB")
@@ -950,8 +962,10 @@ class CombinedRetriever:
         adjusted_emb = [float(x) for x in query_emb]
         if self._expected_vector_dim > 0:
             if len(adjusted_emb) > self._expected_vector_dim:
+                print(f"Warning: embedding dimension {len(adjusted_emb)} is larger than expected {self._expected_vector_dim}; truncating")
                 adjusted_emb = adjusted_emb[:self._expected_vector_dim]
             elif len(adjusted_emb) < self._expected_vector_dim:
+                print(f"Warning: embedding dimension {len(adjusted_emb)} is smaller than expected {self._expected_vector_dim}; padding with zeros")
                 adjusted_emb = adjusted_emb + [0.0] * (self._expected_vector_dim - len(adjusted_emb))
         sql = "SELECT TOP @k c, VectorDistance(c.e, @emb) AS score FROM c ORDER BY VectorDistance(c.e, @emb)"
         if _TIMING:
@@ -997,7 +1011,8 @@ class CombinedRetriever:
                 doc = {k: v for k, v in r.items() if k != "score"}
             if not isinstance(doc, dict):
                 continue
-            doc["_score"] = r.get("score")
+            score = r.get("score")
+            doc["_score"] = score if score is not None else 0
             docs.append(doc)
         _ck(f"vector materialize x{len(docs)} ({container.id}) – done", t_reads)
         return docs
@@ -1012,7 +1027,7 @@ class CombinedRetriever:
         return RetrievedChunk(
             chunk_id=doc.get('id', ''),
             text="\n".join(parts),
-            similarity=1 - doc.get('_score', 0) if '_score' in doc else None,
+            similarity=(1 - doc.get('_score', 0)) if '_score' in doc else None,
             metadata={'_data_source': source, 'embedding': embedding}
         )
     
@@ -1289,6 +1304,7 @@ async def main_async():
     parser.add_argument("--questions-path", type=Path, default=Path(CONFIG["paths"]["questions_path"]))
     parser.add_argument("--output-root", type=Path, default=Path(CONFIG["paths"]["output_root"]))
     parser.add_argument("--timing", action="store_true", help="Print timing checkpoints for each major operation")
+    parser.add_argument("--cosmos-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Cosmos DB")
     args = parser.parse_args()
 
     global _TIMING, _t0
@@ -1301,6 +1317,7 @@ async def main_async():
         k_diverse=args.k_diverse,
         eta=args.eta,
         rescale_power=args.rescale_power,
+        cosmos_az_login=args.cosmos_az_login,
     )
     total_fulltext_k = retriever.total_fulltext_k
     total_vector_k = retriever.total_vector_k
