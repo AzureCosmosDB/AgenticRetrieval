@@ -1,0 +1,49 @@
+name: Integration Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  integration-tests:
+    name: Run Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Generate config.yaml from secrets
+        env:
+          COSMOS_URI: ${{ secrets.COSMOS_URI }}
+          COSMOS_KEY: ${{ secrets.COSMOS_KEY }}
+          COSMOS_DATABASE_NAME: ${{ secrets.COSMOS_DATABASE_NAME }}
+          COSMOS_SOURCE1_CONTAINER: ${{ secrets.COSMOS_SOURCE1_CONTAINER }}
+          COSMOS_SOURCE2_CONTAINER: ${{ secrets.COSMOS_SOURCE2_CONTAINER }}
+          LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          EMBED_ENDPOINT: ${{ secrets.EMBED_ENDPOINT }}
+          EMBED_API_KEY: ${{ secrets.EMBED_API_KEY }}
+          EMBED_MODEL: ${{ secrets.EMBED_MODEL }}
+          EMBED_DIMENSIONS: ${{ secrets.EMBED_DIMENSIONS }}
+        run: python scripts/generate_config.py
+
+      - name: Run integration tests
+        run: pytest tests/ -v --tb=short
