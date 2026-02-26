@@ -70,12 +70,15 @@ COSMOS_ACCOUNT_NAME = CONFIG["cosmos"]["cosmos_account_name"]
 COSMOS_RESOURCE_GROUP = CONFIG["cosmos"]["cosmos_resource_group"]
 AZURE_SUBSCRIPTION_ID = CONFIG["cosmos"]["azure_subscription_id"]
 
-# Embedding configuration (single source of truth)
-EMBED_ENDPOINT = str(CONFIG["llm"]["embed_endpoint"]).strip().strip('"')
-EMBED_MODEL = CONFIG["llm"]["embed_model"]
-EMBEDDING_DIMENSIONS = int(CONFIG["llm"]["embed_dimensions"])
+# Embedding configuration: 'embedding' section overrides 'llm' section for backward compatibility
+_EMBED_CFG = {**CONFIG.get("llm", {}), **CONFIG.get("embedding", {})}
+EMBED_ENDPOINT = str(_EMBED_CFG.get("embed_endpoint", "")).strip().strip('"')
+EMBED_MODEL = _EMBED_CFG.get("embed_model", "")
+EMBEDDING_DIMENSIONS = int(_EMBED_CFG.get("embed_dimensions", 1024))
 LLM_API_VERSION = CONFIG["llm"]["api_version"]
-AZURE_OPENAI_KEY = CONFIG["llm"]["azure_openai_key"]
+_SHARED_KEY = CONFIG["llm"].get("azure_openai_key", "")
+AZURE_OPENAI_KEY = _SHARED_KEY  # kept for backward compatibility
+EMBED_API_KEY = str(_EMBED_CFG.get("embed_api_key") or _SHARED_KEY or "").strip()
 
 # Batch configuration
 EMBEDDING_BATCH_SIZE = int(CONFIG["cosmos"]["embedding_batch_size"])  # Number of texts to embed in one API call
@@ -197,12 +200,12 @@ def get_embedding_client() -> AsyncAzureOpenAI | None:
     if "/openai/deployments/" in azure_endpoint:
         azure_endpoint = azure_endpoint.split("/openai/deployments/")[0]
 
-    if not AZURE_OPENAI_KEY or not str(AZURE_OPENAI_KEY).strip():
-        raise ValueError("llm.azure_openai_key must be set for Azure OpenAI embedding endpoint")
+    if not EMBED_API_KEY:
+        raise ValueError("llm.embed_api_key (or llm.azure_openai_key) must be set for Azure OpenAI embedding endpoint")
 
     return AsyncAzureOpenAI(
         azure_endpoint=azure_endpoint,
-        api_key=AZURE_OPENAI_KEY,
+        api_key=EMBED_API_KEY,
         api_version=LLM_API_VERSION,
     )
 
@@ -652,9 +655,9 @@ async def main_async():
         print("   Please set llm.embed_model in config.yaml.")
         return
 
-    if not EMBED_ENDPOINT.rstrip("/").endswith("/api/embeddings") and (not AZURE_OPENAI_KEY or not str(AZURE_OPENAI_KEY).strip()):
+    if not EMBED_ENDPOINT.rstrip("/").endswith("/api/embeddings") and not EMBED_API_KEY:
         print("❌ Error: Azure OpenAI API key not configured.")
-        print("   Please set llm.azure_openai_key in config.yaml.")
+        print("   Please set llm.embed_api_key (or llm.azure_openai_key) in config.yaml.")
         return
 
     print(f"✓ Embedding endpoint: {EMBED_ENDPOINT}")

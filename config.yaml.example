@@ -31,26 +31,34 @@ paths:
 # Azure OpenAI / LLM settings
 llm:
   llm_endpoint: ""
-  embed_endpoint: ""
-  local_fallback_endpoint: "http://localhost:11434/api/generate"
   api_version: "2024-05-01-preview"
   llm_model: "model-router"
-  local_fallback_model: ""
-  embed_model: ""
-  embed_dimensions: 1024
   temperature: 0.0
   max_completion_tokens: 4096
   max_retries: 2
-  use_local_fallback_for_subtasks: true
   premium_max_concurrency: 4
-  local_max_concurrency: 8
   prompt_cache_size: 2048
+  use_rbac_auth: false
+  token_scope: ""
+  llm_api_key: ""
+
+# Local LLM fallback settings (used for sub-tasks when use_local_fallback_for_subtasks is true)
+local_llm:
+  local_fallback_endpoint: "http://localhost:11434/api/generate"
+  local_fallback_model: ""
+  use_local_fallback_for_subtasks: true
+  local_max_concurrency: 8
+
+# Embedding settings
+embedding:
+  embed_endpoint: ""
+  api_version: "2024-05-01-preview"
+  embed_model: ""
+  embed_dimensions: 1024
   embed_cache_size: 4096
   use_rbac_auth: false
   token_scope: ""
-
-  # Shared API key (used when llm_endpoint/embed_endpoint target Azure OpenAI)
-  azure_openai_key: ""
+  embed_api_key: ""
 
 # Cosmos DB settings
 cosmos:

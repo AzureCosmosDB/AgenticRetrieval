@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import copy
+import datetime
 import json
 import os
 import re
@@ -299,8 +300,14 @@ Final Answer:"""
 class LLMClient:
     def __init__(self):
         llm_cfg = CONFIG["llm"]
+        # Embedding config: 'embedding' section overrides 'llm' section for backward compatibility
+        embed_cfg = {**llm_cfg, **CONFIG.get("embedding", {})}
         self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"])
-        self._api_key = llm_cfg["azure_openai_key"]
+        _shared_key = llm_cfg.get("azure_openai_key", "")
+        self._llm_api_key = str(llm_cfg.get("llm_api_key") or _shared_key or "").strip()
+        self._embed_api_key = str(embed_cfg.get("embed_api_key") or _shared_key or "").strip()
+        # Keep for backward compatibility
+        self._api_key = _shared_key
         self._token_provider = None
         if self._use_rbac_auth:
             token_scope = llm_cfg.get("token_scope")
@@ -312,14 +319,17 @@ class LLMClient:
         self._embed_http_client = None
         self._local_http_client = None
         self._cfg = llm_cfg
-        self._embed_dimensions = int(llm_cfg.get("embed_dimensions") or 0)
-        self._use_local_fallback_for_subtasks = bool(llm_cfg.get("use_local_fallback_for_subtasks", False))
-        self._local_fallback_endpoint = str(llm_cfg.get("local_fallback_endpoint", "http://localhost:11434/api/generate") or "").strip()
-        self._local_fallback_model = str(llm_cfg.get("local_fallback_model", "") or "").strip()
+        self._embed_cfg = embed_cfg
+        # Local fallback config: 'local_llm' section overrides 'llm' section for backward compatibility
+        local_cfg = {**llm_cfg, **CONFIG.get("local_llm", {})}
+        self._embed_dimensions = int(embed_cfg.get("embed_dimensions") or 0)
+        self._use_local_fallback_for_subtasks = bool(local_cfg.get("use_local_fallback_for_subtasks", False))
+        self._local_fallback_endpoint = str(local_cfg.get("local_fallback_endpoint", "http://localhost:11434/api/generate") or "").strip()
+        self._local_fallback_model = str(local_cfg.get("local_fallback_model", "") or "").strip()
         self._premium_semaphore = asyncio.Semaphore(max(1, int(llm_cfg.get("premium_max_concurrency", 4))))
-        self._local_semaphore = asyncio.Semaphore(max(1, int(llm_cfg.get("local_max_concurrency", 8))))
+        self._local_semaphore = asyncio.Semaphore(max(1, int(local_cfg.get("local_max_concurrency", 8))))
         self._response_cache = LRUCache(int(llm_cfg.get("prompt_cache_size", 2048)))
-        self._embed_cache = LRUCache(int(llm_cfg.get("embed_cache_size", 4096)))
+        self._embed_cache = LRUCache(int(embed_cfg.get("embed_cache_size", 4096)))
         self._local_fallback_failure_threshold = 3
         self._local_fallback_cooldown_seconds = 120
         self._local_fallback_failures = 0
@@ -352,9 +362,9 @@ class LLMClient:
             if self._use_rbac_auth:
                 client_kwargs["azure_ad_token_provider"] = self._token_provider
             else:
-                if not self._api_key or not str(self._api_key).strip():
-                    raise ValueError("llm.azure_openai_key must be set when llm.use_rbac_auth is false")
-                client_kwargs["api_key"] = self._api_key
+                if not self._llm_api_key:
+                    raise ValueError("llm.llm_api_key (or llm.azure_openai_key) must be set when llm.use_rbac_auth is false")
+                client_kwargs["api_key"] = self._llm_api_key
             self._llm_client = AsyncAzureOpenAI(**client_kwargs)
         return self._llm_client
     
@@ -362,15 +372,15 @@ class LLMClient:
     def embed_client(self) -> AsyncAzureOpenAI:
         if not self._embed_client:
             client_kwargs = {
-                "api_version": self._cfg["api_version"],
-                "azure_endpoint": self._cfg["embed_endpoint"],
+                "api_version": self._embed_cfg["api_version"],
+                "azure_endpoint": self._embed_cfg["embed_endpoint"],
             }
             if self._use_rbac_auth:
                 client_kwargs["azure_ad_token_provider"] = self._token_provider
             else:
-                if not self._api_key or not str(self._api_key).strip():
-                    raise ValueError("llm.azure_openai_key must be set when llm.use_rbac_auth is false")
-                client_kwargs["api_key"] = self._api_key
+                if not self._embed_api_key:
+                    raise ValueError("embedding.embed_api_key (or llm.azure_openai_key) must be set when use_rbac_auth is false")
+                client_kwargs["api_key"] = self._embed_api_key
             self._embed_client = AsyncAzureOpenAI(**client_kwargs)
         return self._embed_client
     
@@ -670,14 +680,14 @@ class LLMClient:
         cached = self._embed_cache.get(text)
         if isinstance(cached, list):
             return list(cached)
-        embed_endpoint = str(self._cfg.get("embed_endpoint", "")).strip()
+        embed_endpoint = str(self._embed_cfg.get("embed_endpoint", "")).strip()
         if embed_endpoint.endswith("/api/embeddings"):
             try:
                 if self._embed_http_client is None:
                     self._embed_http_client = httpx.AsyncClient(timeout=60)
                 response = await self._embed_http_client.post(
                     embed_endpoint,
-                    json={"model": self._cfg["embed_model"], "prompt": text},
+                    json={"model": self._embed_cfg["embed_model"], "prompt": text},
                     headers={"Content-Type": "application/json"},
                 )
                 response.raise_for_status()
@@ -703,7 +713,7 @@ class LLMClient:
                 raise RuntimeError(f"Invalid JSON response from embedding endpoint {embed_endpoint}: {e}") from e
 
         t = _ck("embed – start")
-        result = await self.embed_client.embeddings.create(input=[text], model=self._cfg["embed_model"])
+        result = await self.embed_client.embeddings.create(input=[text], model=self._embed_cfg["embed_model"])
         _ck("embed – done", t)
         normalized = self._normalize_embedding(result.data[0].embedding)
         self._embed_cache.set(text, normalized)
@@ -863,13 +873,13 @@ class DecomposedRAGPipeline:
 # MAIN
 # =============================================================================
 
-def load_questions(path: Path) -> list[Question]:
-    questions = []
+def load_questions(path: Path) -> dict[str, list[Question]]:
+    questions: dict[str, list[Question]] = {}
     for f in path.glob("*.json"):
         if f.stem.startswith("_") or f.stem.endswith("_test_query"):
             continue
         data = json.loads(f.read_text(encoding="utf-8-sig"))
-        questions.extend(Question(q["question_id"], q["question_text"], f.stem, q.get("answer")) for q in data)
+        questions[f.stem] = [Question(q["question_id"], q["question_text"], f.stem, q.get("answer")) for q in data]
     return questions
 
 async def main_async():
@@ -894,6 +904,7 @@ async def main_async():
     parser.add_argument("--questions-path", type=Path, default=Path(CONFIG["paths"]["questions_path"]))
     parser.add_argument("--output-root", type=Path, default=Path(CONFIG["paths"]["output_root"]))
     parser.add_argument("--timing", action="store_true", help="Print timing checkpoints for each major operation")
+    parser.add_argument("--cosmos-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Cosmos DB")
     args = parser.parse_args()
 
     global _TIMING, _t0
@@ -906,6 +917,7 @@ async def main_async():
         k_diverse=args.k_diverse,
         eta=args.eta,
         rescale_power=args.rescale_power,
+        cosmos_az_login=args.cosmos_az_login,
     )
     total_fulltext_k = retriever.total_fulltext_k
     total_vector_k = retriever.total_vector_k
@@ -930,10 +942,12 @@ async def main_async():
         args.subq_max_concurrency,
     )
     
-    questions = load_questions(args.questions_path)
+    questions_by_file = load_questions(args.questions_path)
+    # Flatten to a list for processing while keeping per-file association via q.group
+    all_questions: list[Question] = [q for qs in questions_by_file.values() for q in qs]
     if args.max_questions:
-        questions = questions[:args.max_questions]
-    print(f"Processing {len(questions)} questions")
+        all_questions = all_questions[:args.max_questions]
+    print(f"Processing {len(all_questions)} questions")
     
     div_suffix = f"_div{args.k_diverse}" if args.k_diverse > 0 else ""
     output_path = args.output_root / f"k{total_k}_ft{total_fulltext_k}_vec{total_vector_k}{div_suffix}"
@@ -960,8 +974,8 @@ async def main_async():
         async with semaphore:
             return await process(q)
 
-    tasks = [asyncio.create_task(bounded_process(q)) for q in questions]
-    with tqdm(total=len(questions)) as pbar:
+    tasks = [asyncio.create_task(bounded_process(q)) for q in all_questions]
+    with tqdm(total=len(all_questions)) as pbar:
         for task in asyncio.as_completed(tasks):
             try:
                 results.append(await task)
@@ -970,19 +984,27 @@ async def main_async():
             finally:
                 pbar.update(1)
     
-    # Save final results - group by question group
-    grouped = {}
+    # Save final results - one answer file per input questions file
+    llm_model = CONFIG["llm"]["llm_model"]
+    embed_model = CONFIG.get("embedding", CONFIG.get("llm", {})).get("embed_model", "")
+    results_by_file: dict[str, list] = {stem: [] for stem in questions_by_file}
     for r in results:
-        group = r.get("group", "default")
-        if group not in grouped:
-            grouped[group] = []
-        grouped[group].append({
+        source_stem = r.get("group", "default")
+        if source_stem not in results_by_file:
+            results_by_file[source_stem] = []
+        results_by_file[source_stem].append({
             "question_id": r["question_id"],
             "question_text": r["question_text"],
             "answer": r["final_answer"],
-            "ground_truth": r.get("ground_truth")
+            "ground_truth": r.get("ground_truth"),
+            "llm_model": llm_model,
+            "embed_model": embed_model,
         })
-    await asyncio.to_thread((output_path / "questions_with_answers.json").write_text, json.dumps(grouped, indent=2))
+    # Single timestamp shared across all output files so they are identifiable as one run
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    for source_stem, answers in results_by_file.items():
+        answers_filename = f"{source_stem}_{timestamp}.json"
+        await asyncio.to_thread((output_path / answers_filename).write_text, json.dumps(answers, indent=2))
     print(f"Done! Results: {output_path}")
 
     await retriever.close()
