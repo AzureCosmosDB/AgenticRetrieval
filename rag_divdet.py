@@ -791,10 +791,12 @@ def greedy_log_det_select(vectors: np.ndarray, query_vec: np.ndarray, k: int,
         sims = V @ query_vec
         for i in range(len(V)):
             V[i] *= (sims[i] ** rescale_power) if sims[i] > 0 else 0
+    if eta < 0:
+        raise ValueError(f"eta must be >= 0, got {eta}")
     n = len(V)
     if k >= n:
         return list(range(n))
-    if eta == 0.0:
+    if eta <= 0:
         chosen = []
         R = V.copy()                              # residual vectors
         scores = np.sum(R * R, axis=1)            # ||R[j]||^2
