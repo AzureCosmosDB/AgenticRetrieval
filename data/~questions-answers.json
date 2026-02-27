@@ -1,0 +1,22 @@
+[
+  {
+    "question_id": "1",
+    "question_text": "what is the max temperature on planet Mars?",
+    "answer": "The maximum temperature on Mars can reach about 20 °C (70 °F) during summer afternoons near the equator."
+  },
+  {
+    "question_id": "2",
+    "question_text": "What is the coldest temperature on Mars?",
+    "answer": "The coldest temperature on Mars can drop to about −125 °C (−195 °F) near the poles during winter."
+  },
+  {
+    "question_id": "3",
+    "question_text": "How long is one day on Mars?",
+    "answer": "One day on Mars, called a sol, lasts about 24 hours and 37 minutes."
+  },
+  {
+    "question_id": "4",
+    "question_text": "Does Mars have an atmosphere?",
+    "answer": "Mars has a very thin atmosphere, composed mostly of carbon dioxide, making it unable to support liquid water on the surface for long."
+  }
+]

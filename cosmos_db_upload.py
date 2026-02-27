@@ -4,12 +4,11 @@ Cosmos DB Document Upload Script with OpenAI Embeddings
 This script:
 1. Automatically ensures missing Cosmos DB containers for enabled upload targets when
     management settings are available; otherwise skips missing targets.
-2. Determines upload targets from `cosmos.sources` in config (legacy structured/unstructured
-    keys are still supported for backward compatibility).
+2. Determines upload targets from `cosmos.sources` in config.
 3. Supports optional `--folder` override to use one input folder for all enabled targets.
 4. Scans all files in each enabled folder (content is assumed JSON), parses documents, and
     generates embeddings from the configured `llm.embed_endpoint` / `llm.embed_model`.
-5. Uploads documents to the matching container and stores vectors in the `e` field.
+5. Uploads documents to the matching container and stores vectors in the configured embedding field.
 """
 
 import os
@@ -96,6 +95,14 @@ def _as_list_of_strings(value: Any) -> list[str]:
     return []
 
 
+def _field_to_cosmos_json_path(field_name: str) -> str:
+    normalized = str(field_name or "e").strip()
+    segments = [segment for segment in normalized.split(".") if segment]
+    if not segments:
+        return "/e"
+    return "/" + "/".join(segments)
+
+
 def _safe_load_json_policy(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, dict):
         return raw
@@ -104,81 +111,39 @@ def _safe_load_json_policy(raw: Any) -> dict[str, Any] | None:
     return None
 
 
-def _legacy_source_configs(cosmos_cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    sources: list[dict[str, Any]] = []
-
-    legacy_specs = [
-        {
-            "id": "structured",
-            "container_name": cosmos_cfg.get("structured_container"),
-            "partition_key_path": cosmos_cfg.get("structured_partition_key_path"),
-            "documents_root": cosmos_cfg.get("structured_documents_root"),
-            "embedding_text_fields": [
-                "title",
-                "summary",
-                "content",
-                "designation",
-                "description",
-                "long_description",
-                "benefits",
-                "tags",
-                "taxonomy",
-            ],
-            "indexing_policy": _safe_load_json_policy(
-                cosmos_cfg.get("indexing_policies_json", {}).get("structured")
-            ),
-            "full_text_policy": _safe_load_json_policy(
-                cosmos_cfg.get("full_text_policies_json", {}).get("structured")
-            ),
-        },
-        {
-            "id": "unstructured",
-            "container_name": cosmos_cfg.get("unstructured_container"),
-            "partition_key_path": cosmos_cfg.get("unstructured_partition_key_path"),
-            "documents_root": cosmos_cfg.get("unstructured_documents_root"),
-            "embedding_text_fields": ["title", "summary", "content"],
-            "indexing_policy": _safe_load_json_policy(
-                cosmos_cfg.get("indexing_policies_json", {}).get("unstructured")
-            ),
-            "full_text_policy": _safe_load_json_policy(
-                cosmos_cfg.get("full_text_policies_json", {}).get("unstructured")
-            ),
-        },
-    ]
-
-    for spec in legacy_specs:
-        if _has_value(spec["container_name"]):
-            sources.append(spec)
-
-    return sources
-
-
-def build_source_configs() -> list[dict[str, Any]]:
-    cosmos_cfg = CONFIG.get("cosmos", {})
+def _sources_upload_config_from_yaml(config: dict[str, Any]) -> list[dict[str, Any]]:
+    cosmos_cfg = config.get("cosmos", {})
     configured_sources = cosmos_cfg.get("sources")
+    if not isinstance(configured_sources, list):
+        raise ValueError(
+            "Invalid config: cosmos.sources must be a list with at least one source entry "
+            "(container_name, documents_root, indexing/full-text policy, etc.)."
+        )
+    if not configured_sources:
+        raise ValueError(
+            "Invalid config: cosmos.sources is empty. Add at least one source entry under cosmos.sources."
+        )
+
     normalized_sources: list[dict[str, Any]] = []
-
-    if isinstance(configured_sources, list) and configured_sources:
-        for idx, source in enumerate(configured_sources, start=1):
-            source = source or {}
-            source_id = str(source.get("id") or f"source_{idx}").strip()
-            normalized_sources.append(
-                {
-                    "id": source_id,
-                    "container_name": source.get("container_name"),
-                    "partition_key_path": source.get("partition_key_path"),
-                    "documents_root": source.get("documents_root"),
-                    "embedding_text_fields": _as_list_of_strings(source.get("embedding_text_fields")),
-                    "indexing_policy": _safe_load_json_policy(source.get("indexing_policy_json")),
-                    "full_text_policy": _safe_load_json_policy(source.get("full_text_policy_json")),
-                }
-            )
-        return normalized_sources
-
-    return _legacy_source_configs(cosmos_cfg)
+    for idx, source in enumerate(configured_sources, start=1):
+        source = source or {}
+        source_id = str(source.get("id") or f"source_{idx}").strip()
+        normalized_sources.append(
+            {
+                "id": source_id,
+                "container_name": source.get("container_name"),
+                "partition_key_path": source.get("partition_key_path"),
+                "documents_root": source.get("documents_root"),
+                "embedding_field": str(source.get("embedding_field") or "e").strip(),
+                "embedding_text_fields": _as_list_of_strings(source.get("embedding_text_fields")),
+                "indexing_policy": _safe_load_json_policy(source.get("indexing_policy_json")),
+                "full_text_policy": _safe_load_json_policy(source.get("full_text_policy_json")),
+            }
+        )
+    return normalized_sources
 
 
-SOURCE_CONFIGS = build_source_configs()
+SOURCE_CONFIGS = _sources_upload_config_from_yaml(CONFIG)
 
 
 def _normalize_embedding(embedding: List[float]) -> List[float]:
@@ -352,6 +317,7 @@ def create_database_and_container_via_management(credential, source_specs: List[
             source.get("id", "unknown"),
             source.get("container_name"),
             source.get("partition_key_path"),
+            source.get("embedding_field") or "e",
             source.get("indexing_policy"),
             source.get("full_text_policy"),
         )
@@ -361,7 +327,7 @@ def create_database_and_container_via_management(credential, source_specs: List[
     max_retries = 5
     retry_delay = 30  # seconds
 
-    for source_id, container_name, partition_key_path, index_policy_cfg, fts_policy_cfg in container_specs:
+    for source_id, container_name, partition_key_path, embedding_field, index_policy_cfg, fts_policy_cfg in container_specs:
         if not container_name or not str(container_name).strip():
             print(f"  ⚠ Skipping {source_id}: container name is not configured")
             continue
@@ -384,13 +350,15 @@ def create_database_and_container_via_management(credential, source_specs: List[
             print(f"  ⚠ Skipping {source_id}: full-text policy is not configured")
             continue
 
+        vector_path = _field_to_cosmos_json_path(str(embedding_field or "e"))
+
         indexing_policy = IndexingPolicy(
             indexing_mode=index_policy_cfg["indexingMode"],
             automatic=index_policy_cfg["automatic"],
             included_paths=[IncludedPath(path=p["path"]) for p in index_policy_cfg["includedPaths"]],
             excluded_paths=[ExcludedPath(path=p["path"]) for p in index_policy_cfg["excludedPaths"]],
             vector_indexes=[
-                VectorIndex(path=v["path"], type=VectorIndexType(v["type"]))
+                VectorIndex(path=vector_path, type=VectorIndexType(v["type"]))
                 for v in index_policy_cfg["vectorIndexes"]
             ],
             full_text_indexes=[
@@ -402,7 +370,7 @@ def create_database_and_container_via_management(credential, source_specs: List[
         vector_embedding_policy = VectorEmbeddingPolicy(
             vector_embeddings=[
                 VectorEmbedding(
-                    path=v["path"],
+                    path=vector_path,
                     data_type=v["dataType"],
                     dimensions=v["dimensions"],
                     distance_function=v["distanceFunction"]
@@ -685,6 +653,7 @@ async def main_async():
                 "documents_root": documents_root,
                 "container_name": container_name,
                 "partition_key_path": partition_key_path,
+                "embedding_field": str(source.get("embedding_field") or "e").strip(),
                 "embedding_text_fields": source.get("embedding_text_fields") or [],
                 "indexing_policy": source.get("indexing_policy"),
                 "full_text_policy": source.get("full_text_policy"),
@@ -768,6 +737,7 @@ async def main_async():
         target_name = target["name"]
         documents_root = target["documents_root"]
         container_name = target["container_name"]
+        embedding_field = str(target.get("embedding_field") or "e").strip()
         text_fields = target["embedding_text_fields"]
 
         if not os.path.isdir(documents_root):
@@ -814,7 +784,7 @@ async def main_async():
                     embeddings = await generate_embeddings_batch(embed_client, batch_texts)
                     total_embed_seconds += (time.perf_counter() - embed_start)
                     for item_doc, embedding in zip(batch_docs, embeddings):
-                        item_doc['e'] = embedding
+                        item_doc[embedding_field] = embedding
 
                     upload_start = time.perf_counter()
                     success_count, failed_count = await upload_documents_batch(container, batch_docs)
@@ -834,7 +804,7 @@ async def main_async():
                 embeddings = await generate_embeddings_batch(embed_client, batch_texts)
                 total_embed_seconds += (time.perf_counter() - embed_start)
                 for item_doc, embedding in zip(batch_docs, embeddings):
-                    item_doc['e'] = embedding
+                    item_doc[embedding_field] = embedding
 
                 upload_start = time.perf_counter()
                 success_count, failed_count = await upload_documents_batch(container, batch_docs)

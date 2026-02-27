@@ -61,6 +61,7 @@ Each entry in `cosmos.sources` is configured independently and includes:
 - `id`
 - `container_name`
 - `partition_key_path`
+- `embedding_field` (document field that stores embedding vectors, e.g. `e`)
 - `documents_root`
 - `embedding_text_fields`
 - `retrieval.vector_k`
@@ -103,7 +104,28 @@ python cosmos_db_upload.py --folder /path/to/documents
 
 ### 3) Run retrieval and generate answers
 
-Run:
+Before running retrieval, prepare your questions file(s).
+
+The repository includes a sample file at `data/questions-answers.json` with this structure:
+
+```json
+[
+  {
+    "question_id": "1",
+    "question_text": "Your question here",
+    "answer": "Ground-truth answer here"
+  }
+]
+```
+
+How to use it:
+
+- Keep the same JSON array structure and field names (`question_id`, `question_text`, `answer`).
+- Replace `question_text` values with questions your own dataset should be able to answer.
+- Replace `answer` values with your own ground-truth answers (the expected/correct answers you define for evaluation).
+- Place your `.json` file(s) in the folder configured by `paths.questions_path`.
+
+Then run:
 
 ```bash
 python rag_divdet.py
@@ -139,6 +161,7 @@ Outputs are written to:
 - `out/k.../questions_with_answers.json` (final grouped answers)
 
 ## Useful runtime overrides
+
 - `--k-diverse`
 - `--eta`
 - `--rescale-power`
@@ -159,7 +182,7 @@ python rag_divdet.py --max-questions 1 --timing
 
 Each line has the form:
 
-```
+```text
   [TIMING] <label>: +<step_elapsed>s  (total <since_start>s)
 ```
 
@@ -199,3 +222,7 @@ Immediately before each Cosmos DB call, the actual query is also printed as a `[
 - **No questions processed / empty output**
   - Confirm `paths.questions_path` points to a directory containing `.json` question files.
   - Confirm `paths.output_root` is writable.
+
+- **Config error: `cosmos.sources` missing/empty**
+  - Both upload and retrieval now fail fast when `cosmos.sources` is not a non-empty list.
+  - Add at least one source entry under `cosmos.sources` with required properties.

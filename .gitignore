@@ -248,3 +248,4 @@ Thumbs.db
 config.yaml
 out/
 out/*.*
+data/skf_full.json

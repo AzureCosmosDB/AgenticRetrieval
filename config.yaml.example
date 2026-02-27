@@ -86,10 +86,12 @@ cosmos:
     }
 
   # Configure each source/container independently
+  # Retrieval in rag_divdet.py is derived from this `sources` list.
   sources:
     - id: "source_1"
       container_name: "container_1"
       partition_key_path: "/pk"
+      embedding_field: "e"
       documents_root: ""
       embedding_text_fields:
         - title
@@ -134,6 +136,7 @@ cosmos:
     - id: "source_2"
       container_name: "container_2"
       partition_key_path: "/pk"
+      embedding_field: "e"
       documents_root: ""
       embedding_text_fields:
         - text
