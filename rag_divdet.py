@@ -796,7 +796,7 @@ def greedy_log_det_select(vectors: np.ndarray, query_vec: np.ndarray, k: int,
     n = len(V)
     if k >= n:
         return list(range(n))
-    if eta <= 0:
+    if eta == 0.0:
         chosen = []
         R = V.copy()                              # residual vectors
         scores = np.sum(R * R, axis=1)            # ||R[j]||^2
