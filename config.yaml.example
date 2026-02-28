@@ -6,7 +6,8 @@
 retrieval:
   # Legacy fallback for older config layout (ignored when cosmos.sources is used)
   k_fulltext: 10
-  k_diverse: 80       # 0 = disabled; >0 = select this many diverse chunks via log-det
+  k_diverse_initial: 80       # 0 = disabled; >0 = select this many diverse chunks via log-det
+  k_diverse_rounds: 80 # diverse chunks for sub-Q rounds (defaults to k_diverse_initial)
   eta: 0.0            # Gram matrix regularization
   rescale_power: 5.0  # Query-similarity rescale power
   cache_size: 2000
@@ -98,8 +99,10 @@ cosmos:
         - summary
         - content
       retrieval:
-        vector_k: 10
-        fulltext_k: 10
+        vector_k_initial: 10
+        vector_k_rounds: 10
+        fulltext_k_initial: 10
+        fulltext_k_rounds: 10
         fulltext_fields:
           - title
       indexing_policy_json: |
@@ -141,8 +144,10 @@ cosmos:
       embedding_text_fields:
         - text
       retrieval:
-        vector_k: 25
-        fulltext_k: 0
+        vector_k_initial: 25
+        vector_k_rounds: 25
+        fulltext_k_initial: 0
+        fulltext_k_rounds: 0
         fulltext_fields: []
       indexing_policy_json: |
         {

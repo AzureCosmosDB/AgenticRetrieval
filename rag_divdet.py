@@ -769,14 +769,20 @@ def _get_source_config(config: dict[str, Any]) -> list[dict[str, Any]]:
         source = source or {}
         retrieval_cfg = source.get("retrieval") or {}
         source_id = str(source.get("id") or f"source_{idx}").strip()
+        vector_k = int(retrieval_cfg.get("vector_k_initial", retrieval_cfg.get("vector_k", 0)) or 0)
+        fulltext_k = int(retrieval_cfg.get("fulltext_k_initial", retrieval_cfg.get("fulltext_k", 0)) or 0)
+        vector_k_rounds = int(retrieval_cfg.get("vector_k_rounds", 0) or 0) or vector_k
+        fulltext_k_rounds = int(retrieval_cfg.get("fulltext_k_rounds", 0) or 0) or fulltext_k
         normalized_sources.append(
             {
                 "id": source_id,
                 "container_name": source.get("container_name"),
                 "partition_key_path": source.get("partition_key_path"),
                 "embedding_field": str(source.get("embedding_field") or "e").strip(),
-                "vector_k": int(retrieval_cfg.get("vector_k", 0) or 0),
-                "fulltext_k": int(retrieval_cfg.get("fulltext_k", 0) or 0),
+                "vector_k_initial": vector_k,
+                "fulltext_k_initial": fulltext_k,
+                "vector_k_rounds": vector_k_rounds,
+                "fulltext_k_rounds": fulltext_k_rounds,
                 "fulltext_fields": _as_list_of_strings(retrieval_cfg.get("fulltext_fields")),
             }
         )
@@ -794,12 +800,14 @@ class CombinedRetriever:
         self,
         retrieval_sources: list[dict[str, Any]],
         fulltext_k_override: int | None = None,
-        k_diverse: int = 0,
+        k_diverse_initial: int = 0,
+        k_diverse_rounds: int | None = None,
         eta: float = 0.0,
         rescale_power: float = 0.0,
         cosmos_az_login: bool = False,
     ):
-        self.k_diverse = k_diverse
+        self.k_diverse_initial = k_diverse_initial
+        self.k_diverse_rounds = k_diverse_rounds if k_diverse_rounds is not None else k_diverse_initial
         self.eta = eta
         self.rescale_power = rescale_power
         self._cosmos_az_login = cosmos_az_login
@@ -814,11 +822,11 @@ class CombinedRetriever:
 
     @property
     def total_fulltext_k(self) -> int:
-        return sum(int(source.get("fulltext_k", 0) or 0) for source in self._sources)
+        return sum(int(source.get("fulltext_k_initial", 0) or 0) for source in self._sources)
 
     @property
     def total_vector_k(self) -> int:
-        return sum(int(source.get("vector_k", 0) or 0) for source in self._sources)
+        return sum(int(source.get("vector_k_initial", 0) or 0) for source in self._sources)
 
     @property
     def source_count(self) -> int:
@@ -840,8 +848,10 @@ class CombinedRetriever:
             container_name = str(source.get("container_name") or "").strip()
             if not container_name:
                 continue
-            vector_k = int(source.get("vector_k", 0) or 0)
-            fulltext_k = int(source.get("fulltext_k", 0) or 0)
+            vector_k = int(source.get("vector_k_initial", source.get("vector_k", 0)) or 0)
+            fulltext_k = int(source.get("fulltext_k_initial", source.get("fulltext_k", 0)) or 0)
+            vector_k_rounds = int(source.get("vector_k_rounds", 0) or 0) or vector_k
+            fulltext_k_rounds = int(source.get("fulltext_k_rounds", 0) or 0) or fulltext_k
             if fulltext_k_override is not None:
                 fulltext_k = int(fulltext_k_override)
             embedding_field = str(source.get("embedding_field") or "e").strip()
@@ -856,8 +866,10 @@ class CombinedRetriever:
                     "container_name": container_name,
                     "partition_key_path": str(source.get("partition_key_path") or "").strip(),
                     "embedding_field": embedding_field,
-                    "vector_k": max(0, vector_k),
-                    "fulltext_k": max(0, fulltext_k),
+                    "vector_k_initial": max(0, vector_k),
+                    "fulltext_k_initial": max(0, fulltext_k),
+                    "vector_k_rounds": max(0, vector_k_rounds),
+                    "fulltext_k_rounds": max(0, fulltext_k_rounds),
                     "fulltext_fields": fulltext_fields,
                 }
             )
@@ -1016,10 +1028,11 @@ class CombinedRetriever:
             metadata={'_data_source': source, 'embedding': embedding}
         )
     
-    async def retrieve(self, query: str) -> list[RetrievedChunk]:
+    async def retrieve(self, query: str, rounds_mode: bool = False) -> list[RetrievedChunk]:
         if self._llm is None:
             raise RuntimeError("Retriever is not initialized")
-        t_retrieve = _ck(f"retrieve – start (q: {query[:60]!r})")
+        mode_label = "rounds" if rounds_mode else "initial"
+        t_retrieve = _ck(f"retrieve({mode_label}) – start (q: {query[:60]!r})")
 
         cached = self._retrieve_cache.get(query)
         if isinstance(cached, list):
@@ -1029,12 +1042,16 @@ class CombinedRetriever:
         chunks: list[RetrievedChunk] = []
         seen: set[tuple[str, Any]] = set()
 
+        ft_key = "fulltext_k_rounds" if rounds_mode else "fulltext_k_initial"
+        vec_key = "vector_k_rounds" if rounds_mode else "vector_k_initial"
+        effective_k_diverse = self.k_diverse_rounds if rounds_mode else self.k_diverse_initial
+
         fulltext_tasks: list[tuple[dict[str, Any], asyncio.Task]] = []
         for source in self._sources:
             container = self._containers.get(source["id"])
             if container is None:
                 continue
-            top_k = int(source.get("fulltext_k", 0) or 0)
+            top_k = int(source.get(ft_key, 0) or 0)
             fields = source.get("fulltext_fields") or []
             if top_k <= 0 or not fields:
                 continue
@@ -1043,7 +1060,7 @@ class CombinedRetriever:
             fulltext_tasks.append(({"source": source, "timer": t_fulltext}, task))
 
         emb: list[float] | None = None
-        vector_sources = [source for source in self._sources if int(source.get("vector_k", 0) or 0) > 0]
+        vector_sources = [source for source in self._sources if int(source.get(vec_key, 0) or 0) > 0]
         if vector_sources:
             t_emb = _ck("  retrieve: embed query – start")
             emb = await self._llm.embed(query)
@@ -1061,7 +1078,7 @@ class CombinedRetriever:
                         container,
                         str(source.get("embedding_field") or "e"),
                         emb,
-                        int(source.get("vector_k", 0) or 0),
+                        int(source.get(vec_key, 0) or 0),
                         query,
                     )
                 )
@@ -1090,7 +1107,7 @@ class CombinedRetriever:
                 chunks.append(self._format_doc(doc, f"{source['id']}_vector", str(source.get("embedding_field") or "e")))
         
         # Diversity selection via greedy log-det maximization
-        if self.k_diverse > 0 and len(chunks) > self.k_diverse:
+        if effective_k_diverse > 0 and len(chunks) > effective_k_diverse:
             t = _ck("  retrieve: diversity embed missing – start")
             missing_chunks = [c for c in chunks if c.metadata.get('embedding') is None]
             n_missing = len(missing_chunks)
@@ -1104,16 +1121,16 @@ class CombinedRetriever:
             if emb is None:
                 emb = await self._llm.embed(query)
             query_vec = np.array(emb, dtype=np.float32)
-            selected = greedy_log_det_select(vectors, query_vec, self.k_diverse, self.eta, self.rescale_power)
-            if len(selected) < self.k_diverse:
+            selected = greedy_log_det_select(vectors, query_vec, effective_k_diverse, self.eta, self.rescale_power)
+            if len(selected) < effective_k_diverse:
                 warnings.warn(
-                    f"greedy_log_det_select returned {len(selected)}/{self.k_diverse}: "
+                    f"greedy_log_det_select returned {len(selected)}/{effective_k_diverse}: "
                     "vectors are nearly linearly dependent",
                     RuntimeWarning,
                     stacklevel=2,
                 )
             chunks = [chunks[i] for i in selected]
-            _ck(f"  retrieve: greedy log-det – done (selected {len(chunks)} of {self.k_diverse} requested)", t)
+            _ck(f"  retrieve: greedy log-det – done (selected {len(chunks)} of {effective_k_diverse} requested)", t)
 
         self._retrieve_cache.set(query, copy.deepcopy(chunks))
         
@@ -1193,7 +1210,7 @@ class DecomposedRAGPipeline:
         return await asyncio.gather(*(_run_one(sub_q) for sub_q in sub_qs))
     
     async def _answer_subquestion(self, sub_q: str) -> SubQuestionResult:
-        chunks = await self.retriever.retrieve(sub_q)
+        chunks = await self.retriever.retrieve(sub_q, rounds_mode=True)
         context = self._format_context(chunks)
         answer = await self.llm.complete(SUBQUESTION_PROMPT.format(context=context, question=sub_q), label=f"LLM sub-Q answer")
         return SubQuestionResult(
@@ -1285,7 +1302,8 @@ async def main_async():
         default=None,
         help="Optional override for fulltext_k across all configured sources",
     )
-    parser.add_argument("--k-diverse", type=int, default=CONFIG["retrieval"]["k_diverse"], help="Diverse chunks to select via log-det (0=disabled)")
+    parser.add_argument("--k-diverse", type=int, default=CONFIG["retrieval"]["k_diverse_initial"], help="Diverse chunks to select via log-det (0=disabled)")
+    parser.add_argument("--k-diverse-rounds", type=int, default=CONFIG["retrieval"].get("k_diverse_rounds"), help="Diverse chunks for sub-Q rounds (defaults to k_diverse_initial)")
     parser.add_argument("--eta", type=float, default=CONFIG["retrieval"]["eta"], help="Gram matrix regularization")
     parser.add_argument("--rescale-power", type=float, default=CONFIG["retrieval"]["rescale_power"], help="Query-similarity rescale power")
     parser.add_argument("--max-sub-questions", type=int, default=pipeline_cfg.get("max_sub_questions", 5))
@@ -1307,7 +1325,8 @@ async def main_async():
     retriever = CombinedRetriever(
         retrieval_sources=RETRIEVAL_SOURCES,
         fulltext_k_override=args.k_fulltext,
-        k_diverse=args.k_diverse,
+        k_diverse_initial=args.k_diverse,
+        k_diverse_rounds=args.k_diverse_rounds,
         eta=args.eta,
         rescale_power=args.rescale_power,
         cosmos_az_login=args.cosmos_az_login,
