@@ -208,6 +208,6 @@ Preliminary Answer (from initial retrieval):
 Answers from successive retrieval rounds (each round retrieved additional context to fill gaps):
 {round_answers}
 
-Based on the above information, provide an answer to the question in a concise way. Try to cover as many aspects, obtained numeric values and specific details in the summary as possible.
+Based on the above information, provide an answer to the question in a concise way. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible.
 
 Concise answer:"""
