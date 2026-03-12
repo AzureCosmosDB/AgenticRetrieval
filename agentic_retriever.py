@@ -268,6 +268,7 @@ class RoundResult:
 
 from prompts import (
     PRELIMINARY_PROMPT,
+    EFFICIENT_PRELIMINARY_PROMPT,
     SUBQUESTION_PROMPT,
     REGENERATE_PROMPT,
     GAP_DECOMPOSE_PROMPT,
@@ -282,6 +283,7 @@ subquery_prefix = (str(CONFIG.get("pipeline", {}).get("subquery_prefix")) or "")
 subquery_prefix = subquery_prefix + "\n\n" if subquery_prefix else ""
 
 PRELIMINARY_PROMPT = preliminary_prefix + PRELIMINARY_PROMPT
+EFFICIENT_PRELIMINARY_PROMPT = preliminary_prefix + EFFICIENT_PRELIMINARY_PROMPT
 EFFICIENT_REGENERATE_PROMPT = subquery_prefix + EFFICIENT_REGENERATE_PROMPT
 SUBQUESTION_PROMPT = subquery_prefix + SUBQUESTION_PROMPT
 
@@ -1040,7 +1042,7 @@ class DecomposedRAGPipeline:
         _ck(f"pipeline: initial retrieve – done ({len(initial_chunks)} chunks)", t)
         initial_context = self._format_context(initial_chunks)
         preliminary = await self.llm.complete(
-            PRELIMINARY_PROMPT.format(context=initial_context, question=question),
+            EFFICIENT_PRELIMINARY_PROMPT.format(context=initial_context, question=question),
             label="LLM preliminary",
         )
         _ck("pipeline: preliminary answer – done", t_run)

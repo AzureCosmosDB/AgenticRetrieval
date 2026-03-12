@@ -25,6 +25,31 @@ INFORMATION GAPS:
 
 Response:"""
 
+EFFICIENT_PRELIMINARY_PROMPT = """You are a helpful assistant that answers questions STRICTLY based on the provided context.
+
+IMPORTANT RULES:
+1. ONLY use information explicitly stated in the context below
+2. DO NOT make assumptions or infer information not directly stated
+3. DO NOT use any external knowledge
+4. If the context does not contain enough information to fully answer the question, clearly state what information IS available and what information IS MISSING
+5. Be precise and cite specific details from the context
+6. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible
+
+Question: {question}
+
+Context Documents:
+{context}
+
+Provide your answer in the following format:
+
+CONCISE ANSWER FROM CONTEXT:
+[Your concise answer based strictly on the provided context]
+
+INFORMATION GAPS:
+[List any aspects of the question that cannot be answered from the provided context]
+
+Response:"""
+
 SUBQUESTION_PROMPT = """You are a helpful assistant that answers questions STRICTLY based on the provided context.
 
 IMPORTANT RULES:
@@ -146,7 +171,7 @@ You have:
 2. A previous answer (which may have gaps)
 3. New context documents retrieved to address the gaps
 
-Your task is to generate an UPDATED and MORE COMPLETE answer by incorporating the new information from the context documents.
+Your task is to generate an UPDATED and MORE COMPLETE but concise answer by incorporating the new information from the context documents.
 
 IMPORTANT RULES:
 1. ONLY use information from the previous answer and the new context documents provided
@@ -165,15 +190,15 @@ New Context Documents (retrieved for identified information gaps):
 
 Provide your updated answer in the following format:
 
-ANSWER FROM CONTEXT:
-[Your updated answer incorporating all available information]
+CONCISE ANSWER FROM CONTEXT:
+[Your updated concise answer incorporating all available information]
 
 INFORMATION GAPS:
 [List any aspects of the question that still cannot be answered]
 
 Response:"""
 
-EFFICIENT_SYNTHESIS_PROMPT = """You are a helpful assistant that synthesizes information to answer questions comprehensively.
+EFFICIENT_SYNTHESIS_PROMPT = """You are a helpful assistant that answers questions.
 
 Original Question: {original_question}
 
@@ -183,16 +208,6 @@ Preliminary Answer (from initial retrieval):
 Answers from successive retrieval rounds (each round retrieved additional context to fill gaps):
 {round_answers}
 
-Based on the above information, provide a comprehensive answer to the original question.
-Synthesize the information coherently, avoid repetition, and ensure the answer directly addresses the original question. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible.
+Based on the above information, provide an answer to the question in a concise way. Try to cover as many aspects, obtained numeric values and specific details in the summary as possible.
 
-Prioritize information from later rounds as they address gaps identified in earlier answers.
-
-At the end, add a summary that directly answers the question in a concise way. Try to cover as many aspects, obtained numeric values and specific details in the summary as possible.
-
-Format your response as:
-[Your comprehensive answer here]
-
-SUMMARY: [Direct answer to the question]
-
-Final Answer:"""
+Concise answer:"""
