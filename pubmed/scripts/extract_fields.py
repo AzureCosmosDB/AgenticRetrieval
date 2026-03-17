@@ -1,10 +1,83 @@
 import argparse
+import csv
 import glob
 import json
 import os
+import pickle
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from tqdm import tqdm
-import duckdb
+
+
+def load_pmcid_pmid_maps(csv_path):
+    """Load PMC-ids.csv into two dicts: pmcid->pmid and pmid->pmcid."""
+    pmcid_to_pmid = {}
+    pmid_to_pmcid = {}
+    print(f"Loading {csv_path} ...")
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, quotechar='"')
+        for row in reader:
+            pmcid = (row.get("PMCID") or "").strip()
+            pmid = (row.get("PMID") or "").strip()
+            if pmcid and pmid:
+                pmcid_to_pmid[pmcid] = pmid
+                pmid_to_pmcid[pmid] = pmcid
+    print(f"  Loaded {len(pmcid_to_pmid)} PMCID<->PMID mappings")
+    return pmcid_to_pmid, pmid_to_pmcid
+
+
+# def load_refs(tsv_path):
+#     """Load C04_ReferenceList_Papers.tsv into two dicts: pmid->{cited pmids} and pmid->{citing pmids}."""
+#     cited_by = defaultdict(list)   # RefPMID -> [PMIDs that cite it]
+#     cites = defaultdict(list)      # PMID -> [RefPMIDs it cites]
+#     print(f"Loading {tsv_path} ...")
+#     with open(tsv_path, newline="", encoding="utf-8") as f:
+#         reader = csv.DictReader(f, delimiter="\t")
+#         for row in reader:
+#             pmid = (row.get("PMID") or "").strip()
+#             ref_pmid = (row.get("RefPMID") or "").strip()
+#             if pmid and ref_pmid:
+#                 cited_by[ref_pmid].append(pmid)
+#                 cites[pmid].append(ref_pmid)
+#     print(f"  Loaded {sum(len(v) for v in cites.values())} citation links")
+#     return cited_by, cites
+
+def load_refs(tsv_path, relevant_pmids):
+    """Load only citation rows where at least one PMID is in relevant_pmids. Uses pickle cache."""
+    cache_path = tsv_path + f".cache.{len(relevant_pmids)}.pkl"
+    if os.path.exists(cache_path):
+        print(f"Loading cached refs from {cache_path} ...")
+        with open(cache_path, "rb") as f:
+            cited_by, cites = pickle.load(f)
+        print(f"  Loaded from cache ({sum(len(v) for v in cites.values())} citation links)")
+        return cited_by, cites
+
+    cited_by = defaultdict(list)
+    cites = defaultdict(list)
+    print(f"Loading {tsv_path} into memory ...")
+    with open(tsv_path, "rb") as f:
+        data = f.read()
+    print(f"  Read {len(data) / (1024**3):.1f} GB, processing lines ...")
+    lines = data.decode("utf-8").split("\n")
+    del data
+    count = 0
+    for line in tqdm(lines[1:]):  # skip header
+        tab = line.find("\t")
+        if tab == -1:
+            continue
+        pmid = line[:tab]
+        ref_pmid = line[tab + 1:].rstrip("\r")
+        if pmid in relevant_pmids or ref_pmid in relevant_pmids:
+            cited_by[ref_pmid].append(pmid)
+            cites[pmid].append(ref_pmid)
+            count += 1
+    del lines
+    print(f"  Loaded {count} citation links, saving cache ...")
+    with open(cache_path, "wb") as f:
+        pickle.dump((dict(cited_by), dict(cites)), f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"  Cache saved to {cache_path}")
+    return cited_by, cites
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -13,62 +86,33 @@ def main():
     parser.add_argument("--refs_tsv", help="Path to TSV file containing paper references")
     parser.add_argument("--limit_low", type=int, default=0, help="Lower index of the papers to process")
     parser.add_argument("--limit_high", type=int, default=1000, help="Upper index of the papers to process")
-    parser.add_argument("--path_duckdb", default=None, help="Path to DuckDB database file (optional)")
     args = parser.parse_args()
     PATH_XML = args.path_xml
-    PMID_PMCID_CSV = args.pmid_pmcid_csv
-    REFS_TSV = args.refs_tsv
 
     xml_files = glob.glob(os.path.join(PATH_XML, "PMC*xxxxxx", "*.xml"))
     ALL_PAPERS = {os.path.splitext(os.path.basename(p))[0] for p in xml_files}
 
-    if args.path_duckdb:
-        con = duckdb.connect(args.path_duckdb)
-    else:
-        # Pre-load tables into memory with indexes for faster querying
-        con = duckdb.connect()
-    print("Loading PMC-ids table...")
-    con.sql(f"""
-        CREATE TABLE pmc_ids AS
-        SELECT PMID, PMCID FROM read_csv('{PMID_PMCID_CSV}',
-            header=true, all_varchar=true, quote='"')
-    """)
-    con.sql("CREATE INDEX idx_pmc_pmcid ON pmc_ids(PMCID)")
-    con.sql("CREATE INDEX idx_pmc_pmid ON pmc_ids(PMID)")
-    print("Loading references table...")
-    con.sql(f"""
-        CREATE TABLE refs AS
-        SELECT PMID, RefPMID FROM read_csv('{REFS_TSV}',
-            delim='\t', header=true)
-    """)
-    con.sql("CREATE INDEX idx_refs_refpmid ON refs(RefPMID)")
-    con.sql("CREATE INDEX idx_refs_pmid ON refs(PMID)")
-    print("Tables loaded.")
+    pmcid_to_pmid, pmid_to_pmcid = load_pmcid_pmid_maps(args.pmid_pmcid_csv)
+    # Only load citation rows involving papers we have XML for
+    relevant_pmids = {pmcid_to_pmid[p] for p in ALL_PAPERS if p in pmcid_to_pmid}
+    cited_by, cites = load_refs(args.refs_tsv, relevant_pmids)
 
 
-
-    def filter_pmids_to_available_pmcids(refs):
-        refs = [r[0] for r in refs]
-        if not refs:
-            return []
-        matches = con.execute(
-            "SELECT PMCID FROM pmc_ids WHERE PMID IN (SELECT UNNEST($1::VARCHAR[]))",
-            [[str(r) for r in refs]]
-        ).fetchall()
-        ref_filtered = [r[0] for r in matches if r[0] in ALL_PAPERS]
-        return ref_filtered
+    def filter_pmids_to_available_pmcids(pmids):
+        result = []
+        for pmid in pmids:
+            pmcid = pmid_to_pmcid.get(str(pmid))
+            if pmcid and pmcid in ALL_PAPERS:
+                result.append(pmcid)
+        return result
 
     def find_citing_and_cited_papers(pmcid):
-        row = con.execute("SELECT PMID FROM pmc_ids WHERE PMCID = $1 LIMIT 1", [pmcid]).fetchone()
-        if row is None or row[0] is None:
+        pmid = pmcid_to_pmid.get(pmcid)
+        if not pmid:
             return [], []
-        pmid = row[0]
-
-        cite = con.execute("SELECT PMID FROM refs WHERE RefPMID = $1", [pmid]).fetchall()
-
-        cited = con.execute("SELECT RefPMID FROM refs WHERE PMID = $1", [pmid]).fetchall()
-
-        return filter_pmids_to_available_pmcids(cite), filter_pmids_to_available_pmcids(cited)
+        citing_pmids = cited_by.get(pmid, [])
+        cited_pmids = cites.get(pmid, [])
+        return filter_pmids_to_available_pmcids(citing_pmids), filter_pmids_to_available_pmcids(cited_pmids)
 
     def extract_text(element):
         """Recursively extract all text content from an XML element."""

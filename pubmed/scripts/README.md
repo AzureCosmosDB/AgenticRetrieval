@@ -13,4 +13,4 @@ pip install duckdb
 
 Run `python extract_fields.py --path_xml <A> --pmid_pmcid_csv <B> --refs_tsv <C>`.
 
-The script will save extracted fields from the first 1000 publications in a json file `extracted.json` in folder `A`. Running it for all publications will take a long time!
+The script will save extracted fields from the first 1000 publications in a json file `extracted.json` in folder `A`. Running it for all publications will take a long time! When running the script for the first time, it will preprocess file `C04_ReferenceList_Papers.tsv`, which might take a longer time. The subsequent runs will be faster because it will read the proprocessed dataset.
