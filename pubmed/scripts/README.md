@@ -6,6 +6,10 @@ Download file `PMC-ids.csv.gz` from `https://ftp.ncbi.nlm.nih.gov/pub/pmc/` and 
 
 Download file `C04_ReferenceList_Papers.tsv.gz` from `https://doi.org/10.6084/m9.figshare.26893861` and unzip it. Let `C` be the path to the unzipped `C04_ReferenceList_Papers.tsv` file.
 
+Install the required Python dependency `duckdb` (if not already installed):
+```bash
+pip install duckdb
+```
 
 Run `python extract_fields.py --path_xml <A> --pmid_pmcid_csv <B> --refs_tsv <C>`.
 
