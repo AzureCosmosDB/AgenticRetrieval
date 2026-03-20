@@ -213,6 +213,9 @@ def parse_article(xml_path: str) -> Optional[dict]:
 
     jmeta = front.find("journal-meta")
     ameta = front.find("article-meta")
+    if ameta is None:
+        log.warning(f"No <article-meta> element in {xml_path}")
+        return None
     body  = root.find("body")
     back  = root.find("back")
 
@@ -292,7 +295,7 @@ def parse_article(xml_path: str) -> Optional[dict]:
     pub_date_release = _parse_date(ameta.find(".//pub-date[@pub-type='pmc-release']"))
 
     # Best available publication year (used as partition key)
-    pub_year = None
+    pub_year = "unknown"
     for pd in ameta.findall(".//pub-date"):
         yr = _text(pd, "year")
         if yr:
@@ -492,13 +495,6 @@ def load_pmid_to_pmcid(csv_path: str) -> dict[str, str]:
 # Module-level lookup table, set from main() before multiprocessing starts.
 _pmid_to_pmcid: dict[str, str] = {}
 
-
-def _init_worker(lookup: dict[str, str]):
-    """Pool initializer: share the PMID→PMCID table with each worker."""
-    global _pmid_to_pmcid
-    _pmid_to_pmcid = lookup
-
-
 def _extract_cited_pmcids(xml_path: str) -> tuple[str, list[str]]:
     """Quick parse: return (this_pmcid, [pmcids referenced by this article]).
 
@@ -544,15 +540,23 @@ def build_citation_maps(
     """Build two mappings:
       - cited_by:  pmcid → list of pmcids that cite it
       - cites:     pmcid → list of pmcids it references
+
+    On Linux (fork), the pmid_to_pmcid dict is shared with workers via
+    copy-on-write by setting the module-level global before pool creation.
+    No pickling overhead.
     """
     from collections import defaultdict
     from multiprocessing import Pool as MPool
+
+    # Set the module-level lookup so forked workers inherit it (COW, no pickle).
+    global _pmid_to_pmcid
+    _pmid_to_pmcid = pmid_to_pmcid
 
     cited_by: dict[str, list[str]] = defaultdict(list)
     cites: dict[str, list[str]] = {}
 
     log.info(f"Building citation graph from {len(xml_files)} files ({workers} workers)...")
-    with MPool(processes=workers, initializer=_init_worker, initargs=(pmid_to_pmcid,)) as pool:
+    with MPool(processes=workers) as pool:
         for i, (src_pmcid, ref_pmcids) in enumerate(
             pool.imap_unordered(_extract_cited_pmcids, xml_files, chunksize=256)
         ):
@@ -708,9 +712,7 @@ def main():
     parser.add_argument("--no-embed",  action="store_true", help="Skip embedding generation")
     parser.add_argument("--limit",     type=int,  help="Process only first N files (testing)")
     parser.add_argument("--dry-run",   action="store_true",
-                        help="Parse & pretty-print first doc only; no embed or upload")
-    parser.add_argument("--workers",   type=int, default=1,
-                        help="Parallel embedding threads (default: 1; increase for large batches)")
+                        help="Parse & pretty-print first 3 docs only; no embed or upload")
     parser.add_argument("--citation-workers", type=int, default=16,
                         help="Parallel workers for building the citation graph (default: 16)")
     args = parser.parse_args()
@@ -815,9 +817,9 @@ def main():
             if (i + 1) % 50 == 0:
                 time.sleep(1)
 
-        # --- Write JSON (one doc per block, pretty-printed) ---
+        # --- Write JSONL (one doc per line, compact JSON) ---
         if out_file:
-            out_file.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+            out_file.write(json.dumps(doc, ensure_ascii=False) + "\n")
 
         # --- Cosmos upsert (batched) ---
         if container:
