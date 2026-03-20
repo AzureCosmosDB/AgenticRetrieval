@@ -578,17 +578,17 @@ PREFIX_LENGTH = int(8192 * 1.5)
 
 def embed_document(doc: dict, client, model: str = EMBEDDING_MODEL) -> dict:
     """
-    Generate a text embedding from title + abstract + full body text.
-    The text is truncated to ~30 000 chars (~7 500 tokens) to stay within
-    the model's 8 192-token limit.
+    Generate a text embedding from title + abstract + full body text + journal title + TOC abstract.
+    The text is truncated to PREFIX_LENGTH characters to stay within
+    the model's 8,192-token limit.
     """
-    text = f"{doc['title']}\n\n{doc['abstract']}\n\n{doc['full_text']}"
+    text = f"Journal Title: {doc['journal_title']}\n\n{doc['title']}\n\nTOC Abstract: {doc['toc_abstract']}\n\n{doc['abstract']}\n\n{doc['full_text']}"
     text = text[:PREFIX_LENGTH]
 
     try:
         response = client.embeddings.create(input=text, model=model)
         doc["embedding"]        = response.data[0].embedding
-        doc["embedding_source"] = "title+abstract+body"
+        doc["embedding_source"] = "title+abstract+body+journal_title+toc_abstract"
         doc["embedding_model"]  = model
     except Exception as e:
         log.warning(f"Embedding failed for {doc['id']}: {e}")
@@ -726,12 +726,6 @@ def main():
     log.info(f"Found {len(xml_files)} XML files under '{args.input}'")
 
     # ------------------------------------------------------------------
-    # Download & load PMID → PMCID mapping
-    # ------------------------------------------------------------------
-    pmc_csv = ensure_pmc_ids_csv(args.input)
-    pmid_to_pmcid = load_pmid_to_pmcid(pmc_csv)
-
-    # ------------------------------------------------------------------
     # Build citation graph (cited_by map) from ALL xml files
     # ------------------------------------------------------------------
     citation_cache = os.path.join(args.input, "citation_maps.json")
@@ -743,6 +737,8 @@ def main():
         cites_map = cached["cites"]
         log.info(f"Loaded {len(cited_by_map)} cited-by, {len(cites_map)} cites entries")
     else:
+        pmc_csv = ensure_pmc_ids_csv(args.input)
+        pmid_to_pmcid = load_pmid_to_pmcid(pmc_csv)
         all_xml_for_citations = sorted(glob.glob(
             os.path.join(args.input, "**", "*.xml"), recursive=True
         ))
