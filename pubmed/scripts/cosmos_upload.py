@@ -574,6 +574,8 @@ def build_citation_maps(
 # Embedding
 # ---------------------------------------------------------------------------
 
+PREFIX_LENGTH = int(8192 * 1.5)
+
 def embed_document(doc: dict, client, model: str = EMBEDDING_MODEL) -> dict:
     """
     Generate a text embedding from title + abstract + full body text.
@@ -581,7 +583,7 @@ def embed_document(doc: dict, client, model: str = EMBEDDING_MODEL) -> dict:
     the model's 8 192-token limit.
     """
     text = f"{doc['title']}\n\n{doc['abstract']}\n\n{doc['full_text']}"
-    text = text[:30_000]
+    text = text[:PREFIX_LENGTH]
 
     try:
         response = client.embeddings.create(input=text, model=model)
