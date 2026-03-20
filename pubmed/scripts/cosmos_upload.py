@@ -8,13 +8,13 @@ Supports:
 
 Usage examples:
   # Dry-run: parse + print JSON, no embedding or upload
-  python convert_to_cosmos.py --dry-run --limit 3
+  python cosmos_upload.py --dry-run --limit 3
 
   # Write to a JSONL file (no Cosmos upload)
-  python convert_to_cosmos.py --output articles.jsonl
+  python cosmos_upload.py --output articles.jsonl
 
   # Full pipeline: embed + upsert to Cosmos DB
-  python convert_to_cosmos.py \
+  python cosmos_upload.py \
       --cosmos-endpoint https://<account>.documents.azure.com:443/ \
       --cosmos-key <key> \
       --openai-key <key>
