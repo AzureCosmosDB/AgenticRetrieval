@@ -1,0 +1,125 @@
+# =============================================================================
+# PubMed / PMC Open Access — Cosmos DB Upload Configuration
+# =============================================================================
+#
+# Used by:  python pubmed/scripts/cosmos_upload.py --config pubmed/scripts/config.pubmed.yaml
+#
+# This config drives cosmos_db_upload infrastructure for:
+#   - Azure OpenAI embedding generation
+#   - Cosmos DB container creation (management plane)
+#   - Document upload (data plane)
+
+# ---------------------------------------------------------------------------
+# Embedding settings (Azure OpenAI)
+# ---------------------------------------------------------------------------
+embedding:
+  embed_endpoint: ""                        # e.g. https://<resource>.openai.azure.com
+  api_version: "2024-05-01-preview"
+  embed_model: "text-embedding-3-small"
+  embed_dimensions: 1536
+  embed_api_key: ""                         # or use RBAC below
+  # use_rbac_auth: true
+  # token_scope: "https://cognitiveservices.azure.com/.default"
+
+# ---------------------------------------------------------------------------
+# Cosmos DB settings
+# ---------------------------------------------------------------------------
+cosmos:
+  uri: ""                                   # e.g. https://<account>.documents.azure.com:443/
+  key: ""                                   # leave empty when using RBAC
+  database_name: "pubmed"
+  use_rbac_auth: true
+
+  # Management-plane credentials (needed to auto-create database + containers)
+  cosmos_account_name: ""                   # e.g. my-cosmos-account
+  cosmos_resource_group: ""
+  azure_subscription_id: ""
+
+  # Upload tuning
+  embedding_batch_size: 50
+
+  # Vector embedding policy applied to all sources below
+  vector_embedding_policy_json: |
+    {
+      "vectorEmbeddings": [
+        {
+          "path": "/embedding",
+          "dataType": "float32",
+          "dimensions": 1536,
+          "distanceFunction": "cosine"
+        }
+      ]
+    }
+
+  # ---------------------------------------------------------------------------
+  # Sources — one entry per Cosmos DB container
+  # ---------------------------------------------------------------------------
+  sources:
+    - id: "pmc_articles"
+      container_name: "articles"
+      partition_key_path: "/id"
+      embedding_field: "embedding"
+      documents_root: ""                    # not used by cosmos_upload.py (it takes --input)
+
+      # Fields concatenated to build embedding input text
+      embedding_text_fields:
+        - journal_title
+        - title
+        - toc_abstract
+        - abstract
+        - full_text
+
+      # Retrieval settings (used at query time by the RAG pipeline)
+      retrieval:
+        vector_k: 25
+        fulltext_k: 10
+        fulltext_fields:
+          - title
+          - abstract
+          - full_text
+
+      # Indexing policy
+      #   - Range index on all simple fields (/*) 
+      #   - Excluded: large text blobs and nested arrays that don't need range indexing
+      #   - Full-text indexes on title, abstract, full_text
+      #   - DiskANN vector index on /embedding
+      indexing_policy_json: |
+        {
+          "indexingMode": "consistent",
+          "automatic": true,
+          "includedPaths": [
+            { "path": "/*" }
+          ],
+          "excludedPaths": [
+            { "path": "/\"_etag\"/?" },
+            { "path": "/embedding/*" },
+            { "path": "/sections/*" },
+            { "path": "/references/*" },
+            { "path": "/authors/*" },
+            { "path": "/journal/*" }
+          ],
+          "fullTextIndexes": [
+            { "path": "/title" },
+            { "path": "/abstract" },
+            { "path": "/full_text" }
+          ],
+          "vectorIndexes": [
+            {
+              "path": "/embedding",
+              "type": "diskANN",
+              "quantizationByteSize": 192,
+              "indexingSearchListSize": 100
+            }
+          ]
+        }
+
+      # Full-text search policy
+      full_text_policy_json: |
+        {
+          "defaultLanguage": "en-US",
+          "fullTextPaths": [
+            { "path": "/title",     "language": "en-US" },
+            { "path": "/abstract",  "language": "en-US" },
+            { "path": "/full_text", "language": "en-US" }
+          ]
+        }
