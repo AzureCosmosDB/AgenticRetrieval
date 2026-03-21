@@ -1,23 +1,24 @@
 """
 Convert PMC Open Access XML articles (JATS format) to JSON for Azure Cosmos DB.
 
+Reuses embedding, upload, and configuration from cosmos_db_upload.py.
+Cosmos DB connection and embedding settings are read from config.yaml
+via cosmos_db_upload.load_config().
+
 Supports:
   - Attribute/field search  (structured metadata fields)
-  - Full-text search        (Cosmos DB integrated vectorization / Azure AI Search)
-  - Vector search           (OpenAI text-embedding-3-small → DiskANN index)
+  - Full-text search        (Cosmos DB full-text index)
+  - Vector search           (embeddings → DiskANN index)
 
 Usage examples:
   # Dry-run: parse + print JSON, no embedding or upload
-  python cosmos_upload.py --dry-run --limit 3
+  python cosmos_upload.py --dry-run --limit 3 --input downloads/temp
 
   # Write to a JSONL file (no Cosmos upload)
-  python cosmos_upload.py --output articles.jsonl
+  python cosmos_upload.py --output articles.jsonl --input downloads/temp --no-embed --no-upload
 
-  # Full pipeline: embed + upsert to Cosmos DB
-  python cosmos_upload.py \
-      --cosmos-endpoint https://<account>.documents.azure.com:443/ \
-      --cosmos-key <key> \
-      --openai-key <key>
+  # Full pipeline: embed + upsert to Cosmos DB (settings from config.yaml)
+  python cosmos_upload.py --input downloads/temp
 """
 
 import os
@@ -29,18 +30,41 @@ import gzip
 import time
 import logging
 import argparse
+import asyncio
 import urllib.request
 from pathlib import Path
 from xml.etree import ElementTree as ET
 from typing import Optional
 
+# ---------------------------------------------------------------------------
+# Import shared infrastructure from cosmos_db_upload (lazy – loaded on demand
+# so that dry-run / parse-only modes work without heavy Azure SDK dependencies)
+# ---------------------------------------------------------------------------
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+cdb = None  # set by _ensure_cdb()
+
+def _ensure_cdb():
+    """Lazily import cosmos_db_upload so dry-run works without Azure SDK."""
+    global cdb
+    if cdb is None:
+        import cosmos_db_upload as _cdb
+        cdb = _cdb
+    return cdb
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 XLINK_NS = "http://www.w3.org/1999/xlink"
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIMS = 1536
-# Cosmos DiskANN vector index requires dimensions to be declared at container creation.
+
+# Default embedding text fields for PMC articles (used with cdb.generate_embedding_text)
+PMC_EMBEDDING_TEXT_FIELDS = ["journal_title", "title", "toc_abstract", "abstract", "full_text"]
+PMC_EMBEDDING_FIELD = "embedding"
+
+# Truncate embedding input to stay within model token limits
+PREFIX_LENGTH = int(8192 * 1.5)
 
 
 # ---------------------------------------------------------------------------
@@ -576,147 +600,103 @@ def build_citation_maps(
 
 
 # ---------------------------------------------------------------------------
-# Embedding
+# Batch helpers (embedding + upload via cosmos_db_upload)
 # ---------------------------------------------------------------------------
 
-PREFIX_LENGTH = int(8192 * 1.5)
+async def _process_batch(
+    docs: list[dict],
+    embed_client,
+    container,
+    out_file,
+    embedding_field: str,
+    text_fields: list[str],
+) -> tuple[int, int]:
+    """Embed and/or upload a batch of documents. Returns (success, failed)."""
+    success = failed = 0
 
-def embed_document(doc: dict, client, model: str = EMBEDDING_MODEL) -> dict:
-    """
-    Generate a text embedding from title + abstract + full body text + journal title + TOC abstract.
-    The text is truncated to PREFIX_LENGTH characters to stay within
-    the model's 8,192-token limit.
-    """
-    text = f"Journal Title: {doc['journal_title']}\n\n{doc['title']}\n\nTOC Abstract: {doc['toc_abstract']}\n\n{doc['abstract']}\n\n{doc['full_text']}"
-    text = text[:PREFIX_LENGTH]
-
-    try:
-        response = client.embeddings.create(input=text, model=model)
-        doc["embedding"]        = response.data[0].embedding
-        doc["embedding_source"] = "title+abstract+body+journal_title+toc_abstract"
-        doc["embedding_model"]  = model
-    except Exception as e:
-        log.warning(f"Embedding failed for {doc['id']}: {e}")
-
-    return doc
-
-
-# ---------------------------------------------------------------------------
-# Cosmos DB helpers
-# ---------------------------------------------------------------------------
-
-def create_cosmos_container(endpoint: str, key: str, db_name: str, container_name: str):
-    """
-    Create a Cosmos DB container with:
-      - DiskANN vector index on /embedding (float32, cosine, 1536 dims)
-      - Full-text indexes on /title, /abstract, /full_text
-      - Range index on all other paths
-      - Partition key: /pub_year
-    """
-    from azure.cosmos import CosmosClient, PartitionKey, exceptions
-
-    client = CosmosClient(endpoint, credential=key)
-    db = client.create_database_if_not_exists(db_name)
-
-    indexing_policy = {
-        "indexingMode": "consistent",
-        "automatic": True,
-        "includedPaths": [{"path": "/*"}],
-        "excludedPaths": [
-            {"path": "/full_text/?"},     # too large for range index
-            {"path": "/embedding/*"},     # handled by vector index
-            {"path": "/sections/*"},
-        ],
-        "fullTextIndexes": [
-            {"path": "/title"},
-            {"path": "/abstract"},
-            {"path": "/full_text"},
-        ],
-        "vectorIndexes": [
-            {"path": "/embedding", "type": "diskANN"},
-        ],
-    }
-
-    vector_embedding_policy = {
-        "vectorEmbeddings": [
-            {
-                "path":             "/embedding",
-                "dataType":         "float32",
-                "distanceFunction": "cosine",
-                "dimensions":       EMBEDDING_DIMS,
-            }
+    # Generate embeddings via cosmos_db_upload
+    if embed_client is not None:
+        texts = [
+            cdb.generate_embedding_text(doc, text_fields)[:PREFIX_LENGTH]
+            for doc in docs
         ]
-    }
-
-    full_text_policy = {
-        "defaultLanguage": "en-US",
-        "fullTextPaths": [
-            {"path": "/title",     "language": "en-US"},
-            {"path": "/abstract",  "language": "en-US"},
-            {"path": "/full_text", "language": "en-US"},
-        ],
-    }
-
-    try:
-        container = db.create_container_if_not_exists(
-            id=container_name,
-            partition_key=PartitionKey(path="/pub_year"),
-            indexing_policy=indexing_policy,
-            vector_embedding_policy=vector_embedding_policy,
-            # full_text_policy requires SDK >= 4.7.0 and preview features enabled
-            # Uncomment if your SDK supports it:
-            # full_text_policy=full_text_policy,
-        )
-        log.info(f"Container '{container_name}' ready with vector + full-text indexes")
-        return container
-    except Exception as e:
-        log.warning(f"Advanced container creation failed ({e}). Falling back to basic.")
-        return db.create_container_if_not_exists(
-            id=container_name,
-            partition_key=PartitionKey(path="/pub_year"),
-        )
-
-
-def upsert_batch(docs: list[dict], container) -> tuple[int, int]:
-    """Upsert a list of docs. Returns (success_count, fail_count)."""
-    from azure.cosmos import exceptions
-
-    ok = fail = 0
-    for doc in docs:
         try:
-            container.upsert_item(doc)
-            ok += 1
-        except exceptions.CosmosHttpResponseError as e:
-            log.error(f"Upsert failed for {doc.get('id')}: {e}")
-            fail += 1
-    return ok, fail
+            embeddings = await cdb.generate_embeddings_batch(embed_client, texts)
+            for doc, emb in zip(docs, embeddings):
+                doc[embedding_field] = emb
+                doc["embedding_source"] = "+".join(text_fields)
+                doc["embedding_model"] = cdb.EMBED_MODEL
+        except Exception as e:
+            log.warning(f"Embedding batch failed: {e}")
+
+    # Write JSONL
+    if out_file:
+        for doc in docs:
+            out_file.write(json.dumps(doc, ensure_ascii=False) + "\n")
+
+    # Upload to Cosmos via cosmos_db_upload
+    if container is not None:
+        s, f = await cdb.upload_documents_batch(container, docs)
+        success += s
+        failed += f
+    else:
+        success += len(docs)
+
+    return success, failed
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert PMC JATS XML → Cosmos DB JSON with embeddings",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--input",    default="downloads/temp",
+    parser.add_argument("--input", default="downloads/temp",
                         help="Root directory containing extracted XML files (searched recursively)")
-    parser.add_argument("--output",   help="Write JSONL to this file (one doc per line)")
-    parser.add_argument("--cosmos-endpoint", metavar="URL",  help="Cosmos DB endpoint")
-    parser.add_argument("--cosmos-key",      metavar="KEY",  help="Cosmos DB primary key")
-    parser.add_argument("--cosmos-db",       default="pubmed",   help="Database name (default: pubmed)")
-    parser.add_argument("--cosmos-container",default="articles", help="Container name (default: articles)")
-    parser.add_argument("--openai-key",      metavar="KEY",
-                        help="OpenAI API key (or set OPENAI_API_KEY env var)")
-    parser.add_argument("--no-embed",  action="store_true", help="Skip embedding generation")
-    parser.add_argument("--limit",     type=int,  help="Process only first N files (testing)")
-    parser.add_argument("--dry-run",   action="store_true",
+    parser.add_argument("--output", help="Write JSONL to this file (one doc per line)")
+    parser.add_argument("--config", default=None,
+                        help="Path to config YAML file (default: config.yaml in repo root)")
+    parser.add_argument("--cosmos-db", default=None,
+                        help="Cosmos DB database name (overrides config; default from config or 'pubmed')")
+    parser.add_argument("--cosmos-container", default="articles",
+                        help="Cosmos DB container name (default: articles)")
+    parser.add_argument("--no-embed", action="store_true", help="Skip embedding generation")
+    parser.add_argument("--no-upload", action="store_true", help="Skip Cosmos DB upload")
+    parser.add_argument("--limit", type=int, help="Process only first N files (testing)")
+    parser.add_argument("--dry-run", action="store_true",
                         help="Parse & pretty-print first 3 docs only; no embed or upload")
     parser.add_argument("--citation-workers", type=int, default=16,
                         help="Parallel workers for building the citation graph (default: 16)")
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+async def main_async():
+    args = parse_args()
+
+    # Determine what we need
+    needs_embed = not args.dry_run and not args.no_embed
+    needs_cosmos = not args.dry_run and not args.no_upload
+
+    # Load config for Cosmos / embedding settings
+    config_path = Path(args.config) if args.config else Path(_REPO_ROOT) / "config.yaml"
+
+    if needs_embed or needs_cosmos:
+        if not config_path.is_file():
+            log.error(f"Config file not found: {config_path}")
+            log.error("Provide --config, or use --dry-run / --no-embed --no-upload to skip.")
+            sys.exit(1)
+        _ensure_cdb().load_config(config_path)
+    elif config_path.is_file():
+        try:
+            _ensure_cdb().load_config(config_path)
+        except Exception:
+            pass  # Non-critical in dry-run / parse-only mode
+
+    db_name = args.cosmos_db or (cdb.DATABASE_NAME if cdb else "") or "pubmed"
+    container_name = args.cosmos_container
 
     # ------------------------------------------------------------------
     # Discover XML files
@@ -725,7 +705,7 @@ def main():
         os.path.join(args.input, "**", "*.xml"), recursive=True
     ))
     if args.limit:
-        xml_files = xml_files[: args.limit]
+        xml_files = xml_files[:args.limit]
     log.info(f"Found {len(xml_files)} XML files under '{args.input}'")
 
     # ------------------------------------------------------------------
@@ -753,38 +733,39 @@ def main():
             json.dump({"cited_by": cited_by_map, "cites": cites_map}, f)
 
     # ------------------------------------------------------------------
-    # Initialise OpenAI client
+    # Initialise embedding client (via cosmos_db_upload config)
     # ------------------------------------------------------------------
-    oai_client = None
-    if not args.no_embed and not args.dry_run:
-        api_key = args.openai_key or os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            log.error(
-                "OpenAI API key required for embeddings. "
-                "Pass --openai-key or set OPENAI_API_KEY, or use --no-embed to skip."
-            )
-            sys.exit(1)
-        from openai import OpenAI
-        oai_client = OpenAI(api_key=api_key)
-        log.info("OpenAI client initialised")
+    embed_client = None
+    if needs_embed:
+        embed_client = _ensure_cdb().get_embedding_client()
+        log.info("Embedding client initialised (from config)")
 
     # ------------------------------------------------------------------
-    # Initialise Cosmos container
+    # Initialise Cosmos client + container (via cosmos_db_upload config)
     # ------------------------------------------------------------------
+    cosmos_client = None
     container = None
-    if args.cosmos_endpoint and args.cosmos_key and not args.dry_run:
-        container = create_cosmos_container(
-            args.cosmos_endpoint, args.cosmos_key,
-            args.cosmos_db, args.cosmos_container,
+    data_plane_credential = None
+
+    if needs_cosmos:
+        use_rbac = _ensure_cdb().CONFIG.get("cosmos", {}).get("use_rbac_auth", False)
+        if use_rbac:
+            from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
+            data_plane_credential = AsyncDefaultAzureCredential()
+        cosmos_client = cdb.get_cosmos_client(
+            use_rbac_auth=use_rbac, credential=data_plane_credential
         )
+        database = cosmos_client.get_database_client(db_name)
+        container = database.get_container_client(container_name)
+        log.info(f"Connected to Cosmos DB: {db_name}/{container_name}")
 
     # ------------------------------------------------------------------
     # Process files
     # ------------------------------------------------------------------
     out_file = open(args.output, "w", encoding="utf-8") if args.output else None
     success = failed = 0
-    upsert_queue: list[dict] = []
-    UPSERT_BATCH = 50
+    batch_size = (cdb.EMBEDDING_BATCH_SIZE if cdb else 0) or 20
+    batch_queue: list[dict] = []
 
     for i, xml_path in enumerate(xml_files):
         log.info(f"[{i+1}/{len(xml_files)}] {Path(xml_path).name}")
@@ -805,47 +786,46 @@ def main():
             print(json.dumps(
                 {k: v for k, v in doc.items()
                  if k not in ("full_text", "sections", "embedding")},
-                indent=2, ensure_ascii=False
+                indent=2, ensure_ascii=False,
             ))
             if i >= 2:   # show 3 docs then stop
                 break
             continue
 
-        # --- Embed ---
-        if oai_client:
-            doc = embed_document(doc, oai_client)
-            # Respect ~3 000 RPM limit
-            if (i + 1) % 50 == 0:
-                time.sleep(1)
-
-        # --- Write JSONL (one doc per line, compact JSON) ---
-        if out_file:
-            out_file.write(json.dumps(doc, ensure_ascii=False) + "\n")
-
-        # --- Cosmos upsert (batched) ---
-        if container:
-            upsert_queue.append(doc)
-            if len(upsert_queue) >= UPSERT_BATCH:
-                ok, fail = upsert_batch(upsert_queue, container)
-                success += ok
-                failed  += fail
-                upsert_queue.clear()
-                log.info(f"  Upserted batch — total ok={success} fail={failed}")
-        else:
-            success += 1
+        batch_queue.append(doc)
+        if len(batch_queue) >= batch_size:
+            s, f = await _process_batch(
+                batch_queue, embed_client, container, out_file,
+                PMC_EMBEDDING_FIELD, PMC_EMBEDDING_TEXT_FIELDS,
+            )
+            success += s
+            failed += f
+            batch_queue.clear()
+            log.info(f"  Batch done — total ok={success} fail={failed}")
 
     # Flush remaining
-    if container and upsert_queue:
-        ok, fail = upsert_batch(upsert_queue, container)
-        success += ok
-        failed  += fail
+    if batch_queue:
+        s, f = await _process_batch(
+            batch_queue, embed_client, container, out_file,
+            PMC_EMBEDDING_FIELD, PMC_EMBEDDING_TEXT_FIELDS,
+        )
+        success += s
+        failed += f
 
     if out_file:
         out_file.close()
+
+    # Cleanup
+    if embed_client is not None:
+        await embed_client.close()
+    if cosmos_client is not None:
+        await cosmos_client.close()
+    if data_plane_credential is not None:
+        await data_plane_credential.close()
 
     log.info(f"Finished. success={success}  failed={failed}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())
  
