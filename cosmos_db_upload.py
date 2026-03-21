@@ -70,6 +70,8 @@ EMBED_MODEL: str = ""
 EMBEDDING_DIMENSIONS: int = 1024
 EMBED_API_VERSION: str = "2024-05-01-preview"
 EMBED_API_KEY: str = ""
+EMBED_USE_RBAC: bool = False
+EMBED_MAX_TOKENS: int = 8192
 EMBEDDING_BATCH_SIZE: int = 20
 VECTOR_EMBEDDING_POLICY: dict[str, Any] | None = None
 SOURCE_CONFIGS: list[dict[str, Any]] = []
@@ -84,6 +86,7 @@ def load_config(config_path: Path) -> None:
     global EMBED_ENDPOINT, EMBED_MODEL, EMBEDDING_DIMENSIONS, EMBED_API_VERSION, EMBED_API_KEY
     global EMBEDDING_BATCH_SIZE, VECTOR_EMBEDDING_POLICY, SOURCE_CONFIGS
     global THROUGHPUT_MODE, THROUGHPUT_VALUE
+    global EMBED_USE_RBAC
 
     with open(config_path) as f:
         CONFIG = yaml.safe_load(f)
@@ -102,6 +105,10 @@ def load_config(config_path: Path) -> None:
     EMBEDDING_DIMENSIONS = int(_embed_cfg.get("embed_dimensions", 1024))
     EMBED_API_VERSION = str(_embed_cfg.get("api_version", "2024-05-01-preview"))
     EMBED_API_KEY = str(_embed_cfg.get("embed_api_key", "") or "").strip()
+    EMBED_USE_RBAC = bool(_embed_cfg.get("use_rbac_auth", False))
+
+    global EMBED_MAX_TOKENS
+    EMBED_MAX_TOKENS = int(_embed_cfg.get("embed_max_tokens", 8192))
 
     EMBEDDING_BATCH_SIZE = int(_cosmos_cfg.get("embedding_batch_size", 20))
 
@@ -281,8 +288,21 @@ def get_embedding_client() -> AsyncAzureOpenAI | None:
     if "/openai/deployments/" in azure_endpoint:
         azure_endpoint = azure_endpoint.split("/openai/deployments/")[0]
 
+    if EMBED_USE_RBAC:
+        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        token_scope = CONFIG.get("embedding", {}).get(
+            "token_scope", "https://cognitiveservices.azure.com/.default"
+        )
+        credential = DefaultAzureCredential()
+        token_provider = get_bearer_token_provider(credential, token_scope)
+        return AsyncAzureOpenAI(
+            azure_endpoint=azure_endpoint,
+            azure_ad_token_provider=token_provider,
+            api_version=EMBED_API_VERSION,
+        )
+
     if not EMBED_API_KEY:
-        raise ValueError("embedding.embed_api_key must be set for Azure OpenAI embedding endpoint")
+        raise ValueError("embedding.embed_api_key must be set (or enable embedding.use_rbac_auth)")
 
     return AsyncAzureOpenAI(
         azure_endpoint=azure_endpoint,
@@ -579,7 +599,12 @@ def create_database_and_container_via_management(credential, source_specs: List[
                 raise
 
 def generate_embedding_text(doc: Dict[str, Any], text_fields: list[str]) -> str:
-    """Build embedding text from configured fields; fallback to full JSON when empty."""
+    """Build embedding text from configured fields; fallback to full JSON when empty.
+
+    The result is truncated to ``EMBED_MAX_TOKENS * 1.5`` characters (a rough
+    char-to-token ratio) so that the embedding API doesn't reject the request.
+    """
+    max_chars = int(EMBED_MAX_TOKENS * 1.5)
     text_parts: list[str] = []
 
     for field_name in text_fields:
@@ -597,7 +622,10 @@ def generate_embedding_text(doc: Dict[str, Any], text_fields: list[str]) -> str:
     if not text_parts:
         text_parts.append(json.dumps(doc, ensure_ascii=False))
 
-    return "\n".join(text_parts)
+    result = "\n".join(text_parts)
+    if len(result) > max_chars:
+        result = result[:max_chars]
+    return result
 
 
 async def generate_embeddings_batch(embed_client: AsyncAzureOpenAI | None, texts: List[str]) -> List[List[float]]:
@@ -779,9 +807,9 @@ async def main_async():
         print("   Please set embedding.embed_model in config.yaml.")
         return
 
-    if not EMBED_ENDPOINT.rstrip("/").endswith("/api/embeddings") and not EMBED_API_KEY:
+    if not EMBED_ENDPOINT.rstrip("/").endswith("/api/embeddings") and not EMBED_API_KEY and not EMBED_USE_RBAC:
         print("❌ Error: Azure OpenAI API key not configured.")
-        print("   Please set embedding.embed_api_key in config.yaml.")
+        print("   Please set embedding.embed_api_key in config.yaml or enable embedding.use_rbac_auth.")
         return
 
     print(f"✓ Embedding endpoint: {EMBED_ENDPOINT}")
@@ -913,7 +941,7 @@ async def main_async():
             print(f"✓ Connected to container '{container_name}' for {target_name} upload")
 
             if document_parser_fn:
-                # Custom parser (e.g. XML → dict)
+                # Custom parser (e.g. XML → dict) — stream in batches
                 if file_glob_pattern:
                     input_files = sorted(glob_mod.glob(
                         os.path.join(documents_root, file_glob_pattern), recursive=True,
@@ -927,15 +955,54 @@ async def main_async():
                 if not input_files:
                     print(f"⚠ No files found for {target_name}. Skipping.")
                     continue
-                all_docs = []
-                for file_path in tqdm(input_files, desc=f"Parsing {target_name} files"):
+
+                print(f"\n📄 Processing {target_name} documents (batch size: {batch_size})...")
+                batch_queue: list[dict] = []
+                for file_path in tqdm(input_files, desc=f"Processing {target_name}"):
                     parse_start = time.perf_counter()
                     doc = document_parser_fn(file_path)
                     total_parse_seconds += (time.perf_counter() - parse_start)
                     if doc is None or not isinstance(doc, dict):
                         failed_uploads += 1
                         continue
-                    all_docs.append(doc)
+                    batch_queue.append(doc)
+
+                    if len(batch_queue) >= batch_size:
+                        batch_texts = [generate_embedding_text(d, text_fields) for d in batch_queue]
+                        try:
+                            embed_start = time.perf_counter()
+                            embeddings = await generate_embeddings_batch(embed_client, batch_texts)
+                            total_embed_seconds += (time.perf_counter() - embed_start)
+                            for item_doc, emb in zip(batch_queue, embeddings):
+                                item_doc[embedding_field] = emb
+                            upload_start = time.perf_counter()
+                            sc, fc = await upload_documents_batch(container, batch_queue)
+                            total_upload_seconds += (time.perf_counter() - upload_start)
+                            successful_uploads += sc
+                            failed_uploads += fc
+                        except Exception as e:
+                            print(f"\nError processing {target_name} batch: {e}")
+                            failed_uploads += len(batch_queue)
+                        batch_queue.clear()
+
+                # Flush remaining
+                if batch_queue:
+                    batch_texts = [generate_embedding_text(d, text_fields) for d in batch_queue]
+                    try:
+                        embed_start = time.perf_counter()
+                        embeddings = await generate_embeddings_batch(embed_client, batch_texts)
+                        total_embed_seconds += (time.perf_counter() - embed_start)
+                        for item_doc, emb in zip(batch_queue, embeddings):
+                            item_doc[embedding_field] = emb
+                        upload_start = time.perf_counter()
+                        sc, fc = await upload_documents_batch(container, batch_queue)
+                        total_upload_seconds += (time.perf_counter() - upload_start)
+                        successful_uploads += sc
+                        failed_uploads += fc
+                    except Exception as e:
+                        print(f"\nError processing {target_name} batch: {e}")
+                        failed_uploads += len(batch_queue)
+                continue
             else:
                 # Default: directory of JSON files
                 print(f"\n🔍 Scanning for files in ({target_name}): {documents_root}")
