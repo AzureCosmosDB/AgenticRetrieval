@@ -71,6 +71,8 @@ EMBED_API_KEY: str = ""
 EMBEDDING_BATCH_SIZE: int = 20
 VECTOR_EMBEDDING_POLICY: dict[str, Any] | None = None
 SOURCE_CONFIGS: list[dict[str, Any]] = []
+THROUGHPUT_MODE: str = "autoscale"   # "autoscale" or "manual"
+THROUGHPUT_VALUE: int = 1000         # max RU/s for autoscale, fixed RU/s for manual
 
 
 def load_config(config_path: Path) -> None:
@@ -79,6 +81,7 @@ def load_config(config_path: Path) -> None:
     global COSMOS_ACCOUNT_NAME, COSMOS_RESOURCE_GROUP, AZURE_SUBSCRIPTION_ID
     global EMBED_ENDPOINT, EMBED_MODEL, EMBEDDING_DIMENSIONS, EMBED_API_VERSION, EMBED_API_KEY
     global EMBEDDING_BATCH_SIZE, VECTOR_EMBEDDING_POLICY, SOURCE_CONFIGS
+    global THROUGHPUT_MODE, THROUGHPUT_VALUE
 
     with open(config_path) as f:
         CONFIG = yaml.safe_load(f)
@@ -99,6 +102,14 @@ def load_config(config_path: Path) -> None:
     EMBED_API_KEY = str(_embed_cfg.get("embed_api_key", "") or "").strip()
 
     EMBEDDING_BATCH_SIZE = int(_cosmos_cfg.get("embedding_batch_size", 20))
+
+    _mode_raw = str(_cosmos_cfg.get("throughput_mode", "autoscale")).strip().lower()
+    if _mode_raw not in ("autoscale", "manual"):
+        raise ValueError(
+            f"Invalid cosmos.throughput_mode '{_mode_raw}'. Must be 'autoscale' or 'manual'."
+        )
+    THROUGHPUT_MODE = _mode_raw
+    THROUGHPUT_VALUE = int(_cosmos_cfg.get("throughput_value", 1000))
 
     _vep_raw = _cosmos_cfg.get("vector_embedding_policy_json")
     if _vep_raw:
@@ -499,15 +510,19 @@ def create_database_and_container_via_management(credential, source_specs: List[
                     "Vector Indexing is not supported for shared throughput offer" in error_str
                     and not tried_dedicated_autoscale
                 ):
+                    if THROUGHPUT_MODE == "autoscale":
+                        throughput_opts = CreateUpdateOptions(
+                            autoscale_settings=AutoscaleSettings(max_throughput=THROUGHPUT_VALUE)
+                        )
+                    else:
+                        throughput_opts = CreateUpdateOptions(throughput=THROUGHPUT_VALUE)
                     print(
-                        "  ⚠ Shared throughput doesn't support vector indexing for this container; "
-                        "retrying with dedicated autoscale throughput (1000 RU min)..."
+                        f"  ⚠ Shared throughput doesn't support vector indexing for this container; "
+                        f"retrying with dedicated {THROUGHPUT_MODE} throughput ({THROUGHPUT_VALUE} RU)..."
                     )
                     container_params = SqlContainerCreateUpdateParameters(
                         resource=container_resource,
-                        options=CreateUpdateOptions(
-                            autoscale_settings=AutoscaleSettings(max_throughput=1000)
-                        )
+                        options=throughput_opts
                     )
                     tried_dedicated_autoscale = True
                     continue

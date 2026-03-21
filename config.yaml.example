@@ -76,6 +76,10 @@ cosmos:
   azure_subscription_id: ""
   embedding_batch_size: 20
 
+  # Throughput settings for new containers (used when dedicated throughput is required)
+  throughput_mode: "autoscale"   # "autoscale" or "manual"
+  throughput_value: 1000         # max RU/s for autoscale, fixed RU/s for manual
+
   vector_embedding_policy_json: |
     {
       "vectorEmbeddings": [
