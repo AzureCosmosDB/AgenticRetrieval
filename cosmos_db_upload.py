@@ -109,8 +109,19 @@ def load_config(config_path: Path) -> None:
             f"Invalid cosmos.throughput_mode '{_throughput_mode_raw}'. Must be 'autoscale' or 'manual'."
         )
     THROUGHPUT_MODE = _throughput_mode_raw
-    THROUGHPUT_VALUE = int(_cosmos_cfg.get("throughput_value", 1000))
 
+    _throughput_raw = _cosmos_cfg.get("throughput_value", 1000)
+    try:
+        THROUGHPUT_VALUE = int(_throughput_raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid cosmos.throughput_value '{_throughput_raw}'. Must be a positive integer."
+        )
+
+    if THROUGHPUT_VALUE <= 0:
+        raise ValueError(
+            f"Invalid cosmos.throughput_value '{THROUGHPUT_VALUE}'. Must be a positive integer."
+        )
     _vep_raw = _cosmos_cfg.get("vector_embedding_policy_json")
     if _vep_raw:
         VECTOR_EMBEDDING_POLICY = json.loads(_vep_raw) if isinstance(_vep_raw, str) else _vep_raw
