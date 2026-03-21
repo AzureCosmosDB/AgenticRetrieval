@@ -1,4 +1,4 @@
-"""Tests for cosmos_retriever module extraction."""
+"""Tests for utils.cosmos_retriever module extraction."""
 
 import pytest
 
@@ -8,8 +8,8 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def test_cosmos_retriever_importable():
-    """cosmos_retriever should be importable directly (no circular import)."""
-    import cosmos_retriever
+    """utils.cosmos_retriever should be importable directly (no circular import)."""
+    from utils import cosmos_retriever
     assert hasattr(cosmos_retriever, "CombinedRetriever")
     assert hasattr(cosmos_retriever, "RETRIEVAL_SOURCES")
 
@@ -17,7 +17,7 @@ def test_cosmos_retriever_importable():
 def test_rag_divdet_exposes_combined_retriever():
     """CombinedRetriever should be accessible via agentic_retriever after extraction."""
     import agentic_retriever
-    from cosmos_retriever import CombinedRetriever
+    from utils.cosmos_retriever import CombinedRetriever
     # main_async imports CombinedRetriever at call time; verify the class exists
     assert CombinedRetriever is not None
     # DecomposedRAGPipeline should still be in agentic_retriever
@@ -30,7 +30,7 @@ def test_rag_divdet_exposes_combined_retriever():
 
 def test_combined_retriever_has_expected_methods():
     """CombinedRetriever must expose the same public interface after extraction."""
-    from cosmos_retriever import CombinedRetriever
+    from utils.cosmos_retriever import CombinedRetriever
     expected_attrs = [
         "initialize",
         "retrieve",
@@ -45,7 +45,7 @@ def test_combined_retriever_has_expected_methods():
 
 def test_retrieval_sources_is_list():
     """RETRIEVAL_SOURCES should be a non-empty list of dicts."""
-    from cosmos_retriever import RETRIEVAL_SOURCES
+    from utils.cosmos_retriever import RETRIEVAL_SOURCES
     assert isinstance(RETRIEVAL_SOURCES, list)
     assert len(RETRIEVAL_SOURCES) > 0
     for source in RETRIEVAL_SOURCES:
@@ -56,7 +56,7 @@ def test_retrieval_sources_is_list():
 
 def test_stopwords_set_exists():
     """STOPWORDS should be a non-empty set."""
-    from cosmos_retriever import STOPWORDS
+    from utils.cosmos_retriever import STOPWORDS
     assert isinstance(STOPWORDS, set)
     assert len(STOPWORDS) > 0
     assert "the" in STOPWORDS
@@ -64,7 +64,7 @@ def test_stopwords_set_exists():
 
 def test_as_list_of_strings():
     """_as_list_of_strings should convert list items to stripped strings."""
-    from cosmos_retriever import _as_list_of_strings
+    from utils.cosmos_retriever import _as_list_of_strings
     assert _as_list_of_strings(["a", "b", "c"]) == ["a", "b", "c"]
     assert _as_list_of_strings([1, 2]) == ["1", "2"]
     assert _as_list_of_strings([" x ", ""]) == ["x"]
@@ -77,9 +77,9 @@ def test_as_list_of_strings():
 # ---------------------------------------------------------------------------
 
 def test_timing_flag_visible_via_module():
-    """Runtime mutations to agentic_retriever._TIMING must be visible in cosmos_retriever."""
+    """Runtime mutations to agentic_retriever._TIMING must be visible in utils.cosmos_retriever."""
     import agentic_retriever
-    import cosmos_retriever
+    from utils import cosmos_retriever
 
     original = agentic_retriever._TIMING
     try:

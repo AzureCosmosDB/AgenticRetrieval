@@ -891,11 +891,11 @@ class LLMClient:
             self._local_http_client = None
 
 # =============================================================================
-# COSMOS DB RETRIEVER (moved to cosmos_retriever.py)
+# COSMOS DB RETRIEVER (moved to utils/cosmos_retriever.py)
 # =============================================================================
 
 if TYPE_CHECKING:
-    from cosmos_retriever import CombinedRetriever
+    from utils.cosmos_retriever import CombinedRetriever
 
 # =============================================================================
 # DECOMPOSED RAG PIPELINE
@@ -1169,7 +1169,7 @@ async def main_async():
     pre_args, _ = pre_parser.parse_known_args()
     load_config(pre_args.config)
 
-    from cosmos_retriever import CombinedRetriever, RETRIEVAL_SOURCES
+    from utils.cosmos_retriever import CombinedRetriever, RETRIEVAL_SOURCES
 
     # --- Phase 2: full argument parsing (defaults drawn from loaded config) ---
     parser = argparse.ArgumentParser()
@@ -1318,7 +1318,7 @@ async def main_async():
     await llm.close()
 
 if __name__ == "__main__":
-    # Ensure 'import agentic_retriever' in other modules (e.g. cosmos_retriever)
+    # Ensure 'import agentic_retriever' in other modules (e.g. utils.cosmos_retriever)
     # resolves to this same module instance, not a duplicate with empty CONFIG.
     sys.modules.setdefault("agentic_retriever", sys.modules[__name__])
 

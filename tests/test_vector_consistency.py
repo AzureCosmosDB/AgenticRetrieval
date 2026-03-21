@@ -44,7 +44,7 @@ load_config(args.config)
 
 # Now safe to import modules that read CONFIG at import time
 from agentic_retriever import CONFIG  # noqa: E402
-from cosmos_retriever import CombinedRetriever, _get_source_config  # noqa: E402
+from utils.cosmos_retriever import CombinedRetriever, _get_source_config  # noqa: E402
 
 
 def _chunk_signature(chunks):
