@@ -72,7 +72,7 @@ EMBEDDING_BATCH_SIZE: int = 20
 VECTOR_EMBEDDING_POLICY: dict[str, Any] | None = None
 SOURCE_CONFIGS: list[dict[str, Any]] = []
 THROUGHPUT_MODE: str = "autoscale"   # "autoscale" or "manual"
-THROUGHPUT_VALUE: int = 1000         # max RU/s for autoscale, fixed RU/s for manual
+THROUGHPUT_VALUE: int = 1000         # max RU/s (autoscale) or fixed RU/s (manual)
 
 
 def load_config(config_path: Path) -> None:
@@ -103,12 +103,12 @@ def load_config(config_path: Path) -> None:
 
     EMBEDDING_BATCH_SIZE = int(_cosmos_cfg.get("embedding_batch_size", 20))
 
-    _mode_raw = str(_cosmos_cfg.get("throughput_mode", "autoscale")).strip().lower()
-    if _mode_raw not in ("autoscale", "manual"):
+    _throughput_mode_raw = str(_cosmos_cfg.get("throughput_mode", "autoscale")).strip().lower()
+    if _throughput_mode_raw not in ("autoscale", "manual"):
         raise ValueError(
-            f"Invalid cosmos.throughput_mode '{_mode_raw}'. Must be 'autoscale' or 'manual'."
+            f"Invalid cosmos.throughput_mode '{_throughput_mode_raw}'. Must be 'autoscale' or 'manual'."
         )
-    THROUGHPUT_MODE = _mode_raw
+    THROUGHPUT_MODE = _throughput_mode_raw
     THROUGHPUT_VALUE = int(_cosmos_cfg.get("throughput_value", 1000))
 
     _vep_raw = _cosmos_cfg.get("vector_embedding_policy_json")
