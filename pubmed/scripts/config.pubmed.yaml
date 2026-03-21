@@ -38,6 +38,10 @@ cosmos:
   cosmos_resource_group: ""
   azure_subscription_id: ""
 
+  # Throughput tuning
+  throughput_mode: "autoscale"        # "autoscale" or "manual"
+  throughput_value: 60000             # max RU/s for autoscale
+
   # Upload tuning
   embedding_batch_size: 50
 
