@@ -461,6 +461,7 @@ def ensure_pmc_ids_csv(data_dir: str) -> str:
         return csv_path
 
     if not os.path.isfile(gz_path):
+        os.makedirs(os.path.dirname(gz_path), exist_ok=True)
         log.info(f"Downloading {PMC_IDS_URL} ...")
         urllib.request.urlretrieve(PMC_IDS_URL, gz_path)
         log.info(f"Downloaded to {gz_path}")
