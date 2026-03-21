@@ -4,6 +4,31 @@ End-to-end workflow for downloading PMC Open Access articles, uploading them to
 Azure Cosmos DB with vector embeddings, and optionally building a citation
 graph.
 
+## Data source & licensing
+
+This pipeline uses the **PMC Open Access Commercial subset** — a collection of
+full-text biomedical articles from [PubMed Central](https://www.ncbi.nlm.nih.gov/pmc/)
+that are available for commercial reuse under permissive licenses.
+
+| Resource | Link |
+|---|---|
+| PMC OA Subset overview | <https://www.ncbi.nlm.nih.gov/pmc/tools/openftlist/> |
+| Commercial-use file list (oa_comm) | <https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_bulk/oa_comm/> |
+| PMC OA license terms | <https://www.ncbi.nlm.nih.gov/pmc/tools/textmining/> |
+| NLM Terms of Service | <https://www.nlm.nih.gov/databases/download/terms_and_conditions.html> |
+
+Articles in the commercial subset are distributed under one of these Creative
+Commons licenses:
+
+- **CC0** — Public Domain
+- **CC BY** — Attribution
+- **CC BY-SA** — Attribution-ShareAlike
+- **CC BY-ND** — Attribution-NoDerivatives
+
+Each article's specific license is recorded in the `license_tag` and
+`license_url` fields of the parsed document. Always check and comply with the
+individual article's license when redistributing content.
+
 ## Prerequisites
 
 ```bash
@@ -103,21 +128,6 @@ The citation graph script:
    - **cites**: article → list of articles it references
 5. Saves to `citation_maps.json`
 6. With `--patch-cosmos`, sends patch operations to update each document
-
-## Directory structure
-
-```
-pubmed/
-├── README.md                       ← this file
-├── articles.jsonl                  ← sample / exported JSONL (if any)
-├── downloads/                      ← downloaded & extracted XML files
-│   └── temp/                       ← extracted XML (set as documents_root)
-└── scripts/
-    ├── config.pubmed.yaml          ← Cosmos DB + embedding config
-    ├── download.py                 ← bulk downloader from NCBI FTP
-    ├── parse_article.py            ← JATS XML → dict converter
-    └── build_citation_graph.py     ← citation graph builder + Cosmos patcher
-```
 
 ## Configuration reference
 
