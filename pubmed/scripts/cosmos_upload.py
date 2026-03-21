@@ -36,6 +36,14 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 from typing import Optional
 
+from utils.xml_helpers import (
+    text as _text,
+    all_text as _all_text,
+    attr as _attr,
+    parse_date as _parse_date,
+    XLINK_NS,
+)
+
 # ---------------------------------------------------------------------------
 # Import shared infrastructure from cosmos_db_upload (lazy – loaded on demand
 # so that dry-run / parse-only modes work without heavy Azure SDK dependencies)
@@ -57,61 +65,12 @@ def _ensure_cdb():
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-XLINK_NS = "http://www.w3.org/1999/xlink"
-
 # Default embedding text fields for PMC articles (used with cdb.generate_embedding_text)
 PMC_EMBEDDING_TEXT_FIELDS = ["journal_title", "title", "toc_abstract", "abstract", "full_text"]
 PMC_EMBEDDING_FIELD = "embedding"
 
 # Truncate embedding input to stay within model token limits
 PREFIX_LENGTH = int(8192 * 1.5)
-
-
-# ---------------------------------------------------------------------------
-# XML parsing helpers
-# ---------------------------------------------------------------------------
-
-def _text(el, path: str, default: str = "") -> str:
-    """Find a child element by path and return all inner text concatenated."""
-    if el is None:
-        return default
-    node = el.find(path)
-    if node is None:
-        return default
-    return "".join(node.itertext()).strip()
-
-
-def _all_text(el, path: str) -> list[str]:
-    """Return text of every element matching path."""
-    if el is None:
-        return []
-    return ["".join(n.itertext()).strip() for n in el.findall(path) if "".join(n.itertext()).strip()]
-
-
-def _attr(el, path: str, attr: str, ns_map: dict | None = None, default: str = "") -> str:
-    """Find element by path and return one of its attributes."""
-    if el is None:
-        return default
-    node = el.find(path)
-    if node is None:
-        return default
-    if ns_map:
-        # Build Clark notation key, e.g. {http://www.w3.org/1999/xlink}href
-        for prefix, uri in ns_map.items():
-            attr = attr.replace(f"{prefix}:", f"{{{uri}}}")
-    return node.get(attr, default)
-
-
-def _parse_date(el) -> Optional[str]:
-    """Convert a JATS <date> or <pub-date> element to an ISO date string."""
-    if el is None:
-        return None
-    day   = _text(el, "day")   or "01"
-    month = _text(el, "month") or "01"
-    year  = _text(el, "year")
-    if year:
-        return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
-    return None
 
 
 # ---------------------------------------------------------------------------
