@@ -12,13 +12,15 @@ This script:
 """
 
 import os
+import glob as glob_mod
 import argparse
 import asyncio
+import importlib.util
 import json
 import time
 import re
 import hashlib
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 import httpx
 from azure.cosmos.aio import CosmosClient
 from azure.cosmos import exceptions
@@ -226,9 +228,38 @@ def _sources_upload_config_from_yaml(config: dict[str, Any]) -> list[dict[str, A
                 "embedding_text_fields": embedding_text_fields,
                 "indexing_policy": indexing_policy,
                 "full_text_policy": full_text_policy,
+                "document_parser": source.get("document_parser"),
+                "file_glob": source.get("file_glob"),
             }
         )
     return normalized_sources
+
+
+def _load_document_parser(parser_spec: str) -> Callable[[str], Optional[Dict[str, Any]]]:
+    """Import a document parser from a ``'path/to/module.py:function'`` spec.
+
+    The spec may also be a dotted module path (``pkg.mod:func``).
+    """
+    if ":" not in parser_spec:
+        raise ValueError(
+            f"document_parser must be 'module_path:function_name', got: {parser_spec}"
+        )
+    module_path, func_name = parser_spec.rsplit(":", 1)
+
+    if os.path.isfile(module_path):
+        spec = importlib.util.spec_from_file_location("_custom_parser", module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load module from {module_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    else:
+        import importlib as _imp
+        mod = _imp.import_module(module_path)
+
+    fn = getattr(mod, func_name, None)
+    if fn is None:
+        raise AttributeError(f"Module {module_path} has no attribute '{func_name}'")
+    return fn
 
 
 def _normalize_embedding(embedding: List[float]) -> List[float]:
@@ -782,6 +813,8 @@ async def main_async():
                 "embedding_text_fields": source.get("embedding_text_fields") or [],
                 "indexing_policy": source.get("indexing_policy"),
                 "full_text_policy": source.get("full_text_policy"),
+                "document_parser": source.get("document_parser"),
+                "file_glob": source.get("file_glob"),
             }
         )
 
@@ -860,6 +893,9 @@ async def main_async():
 
         # Load documents from source
         is_jsonl = documents_root.endswith('.jsonl') and os.path.isfile(documents_root)
+        parser_spec = target.get("document_parser")
+        file_glob_pattern = target.get("file_glob")
+        document_parser_fn = _load_document_parser(parser_spec) if parser_spec else None
 
         if is_jsonl:
             container = database.get_container_client(container_name)
@@ -875,26 +911,53 @@ async def main_async():
             container = database.get_container_client(container_name)
             uploaded_containers.append(container_name)
             print(f"✓ Connected to container '{container_name}' for {target_name} upload")
-            print(f"\n🔍 Scanning for files in ({target_name}): {documents_root}")
-            input_files = await asyncio.to_thread(find_all_input_files, documents_root)
-            total_files_seen += len(input_files)
-            print(f"✓ Found {len(input_files)} files")
-            if not input_files:
-                print(f"⚠ No files found for {target_name}. Skipping.")
-                continue
-            all_docs = []
-            for file_path in tqdm(input_files, desc=f"Loading {target_name} files"):
-                parse_start = time.perf_counter()
-                doc = await load_json_document(file_path)
-                if doc is None or not isinstance(doc, dict):
-                    failed_uploads += 1
-                    total_parse_seconds += (time.perf_counter() - parse_start)
+
+            if document_parser_fn:
+                # Custom parser (e.g. XML → dict)
+                if file_glob_pattern:
+                    input_files = sorted(glob_mod.glob(
+                        os.path.join(documents_root, file_glob_pattern), recursive=True,
+                    ))
+                else:
+                    input_files = await asyncio.to_thread(find_all_input_files, documents_root)
+                total_files_seen += len(input_files)
+                print(f"\n🔍 Scanning ({target_name}): {documents_root}  "
+                      f"[parser={parser_spec}, glob={file_glob_pattern or '*'}]")
+                print(f"✓ Found {len(input_files)} files")
+                if not input_files:
+                    print(f"⚠ No files found for {target_name}. Skipping.")
                     continue
-                relative_path = os.path.relpath(file_path, documents_root)
-                doc['_source_file'] = relative_path
-                doc = replace_document_id(doc, relative_path)
-                all_docs.append(doc)
-                total_parse_seconds += (time.perf_counter() - parse_start)
+                all_docs = []
+                for file_path in tqdm(input_files, desc=f"Parsing {target_name} files"):
+                    parse_start = time.perf_counter()
+                    doc = document_parser_fn(file_path)
+                    total_parse_seconds += (time.perf_counter() - parse_start)
+                    if doc is None or not isinstance(doc, dict):
+                        failed_uploads += 1
+                        continue
+                    all_docs.append(doc)
+            else:
+                # Default: directory of JSON files
+                print(f"\n🔍 Scanning for files in ({target_name}): {documents_root}")
+                input_files = await asyncio.to_thread(find_all_input_files, documents_root)
+                total_files_seen += len(input_files)
+                print(f"✓ Found {len(input_files)} files")
+                if not input_files:
+                    print(f"⚠ No files found for {target_name}. Skipping.")
+                    continue
+                all_docs = []
+                for file_path in tqdm(input_files, desc=f"Loading {target_name} files"):
+                    parse_start = time.perf_counter()
+                    doc = await load_json_document(file_path)
+                    if doc is None or not isinstance(doc, dict):
+                        failed_uploads += 1
+                        total_parse_seconds += (time.perf_counter() - parse_start)
+                        continue
+                    relative_path = os.path.relpath(file_path, documents_root)
+                    doc['_source_file'] = relative_path
+                    doc = replace_document_id(doc, relative_path)
+                    all_docs.append(doc)
+                    total_parse_seconds += (time.perf_counter() - parse_start)
         else:
             print(f"⚠ Skipping {target_name} upload: path does not exist: {documents_root}")
             continue

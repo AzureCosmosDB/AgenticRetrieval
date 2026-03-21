@@ -2,12 +2,15 @@
 # PubMed / PMC Open Access — Cosmos DB Upload Configuration
 # =============================================================================
 #
-# Used by:  python pubmed/scripts/cosmos_upload.py --config pubmed/scripts/config.pubmed.yaml
+# Used by:  python cosmos_db_upload.py --config pubmed/scripts/config.pubmed.yaml
 #
 # This config drives cosmos_db_upload infrastructure for:
 #   - Azure OpenAI embedding generation
 #   - Cosmos DB container creation (management plane)
 #   - Document upload (data plane)
+#
+# The document_parser field tells cosmos_db_upload.py to use a custom parser
+# (JATS XML → dict) instead of the default JSON loader.
 
 # ---------------------------------------------------------------------------
 # Embedding settings (Azure OpenAI)
@@ -59,7 +62,11 @@ cosmos:
       container_name: "articles"
       partition_key_path: "/id"
       embedding_field: "embedding"
-      documents_root: ""                    # not used by cosmos_upload.py (it takes --input)
+
+      # Custom parser: parse JATS XML files instead of JSON
+      document_parser: "pubmed/scripts/parse_article.py:parse_article"
+      file_glob: "**/*.xml"
+      documents_root: "pubmed/downloads/temp"   # directory of extracted XML files
 
       # Fields concatenated to build embedding input text
       embedding_text_fields:
@@ -79,7 +86,7 @@ cosmos:
           - full_text
 
       # Indexing policy
-      #   - Range index on all simple fields (/*) 
+      #   - Range index on all simple fields (/*)
       #   - Excluded: large text blobs and nested arrays that don't need range indexing
       #   - Full-text indexes on title, abstract, full_text
       #   - DiskANN vector index on /embedding
