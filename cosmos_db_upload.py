@@ -54,6 +54,7 @@ from pathlib import Path
 
 LOCAL_EMBED_WORKERS = 8
 UPLOAD_WORKERS = 8
+CONCURRENT_BATCHES = 1  # number of batches to process in parallel
 
 # ---------------------------------------------------------------------------
 # Module-level config placeholders (set by load_config)
@@ -109,6 +110,9 @@ def load_config(config_path: Path) -> None:
 
     global EMBED_MAX_TOKENS
     EMBED_MAX_TOKENS = int(_embed_cfg.get("embed_max_tokens", 8192))
+
+    global CONCURRENT_BATCHES
+    CONCURRENT_BATCHES = int(_cosmos_cfg.get("concurrent_batches", 1))
 
     EMBEDDING_BATCH_SIZE = int(_cosmos_cfg.get("embedding_batch_size", 20))
 
@@ -405,7 +409,7 @@ def create_database_and_container_via_management(credential, source_specs: List[
     print(f"  Account: {account_name}")
     print(f"  Resource Group: {resource_group}")
     print(f"  Subscription: {subscription_id}")
-    
+
     # Enable Vector Search and Full Text Search capabilities if needed
     print("\n  Checking account capabilities...")
     enable_vector_search_capability(credential, subscription_id, resource_group, account_name)
@@ -546,8 +550,16 @@ def create_database_and_container_via_management(credential, source_specs: List[
             vector_embedding_policy=vector_embedding_policy,
             full_text_policy=full_text_policy
         )
-        container_params = SqlContainerCreateUpdateParameters(resource=container_resource)
-        tried_dedicated_autoscale = False
+        # Apply configured throughput from the start
+        if THROUGHPUT_MODE == "autoscale":
+            throughput_opts = CreateUpdateOptions(
+                autoscale_settings=AutoscaleSettings(max_throughput=THROUGHPUT_VALUE)
+            )
+        else:
+            throughput_opts = CreateUpdateOptions(throughput=THROUGHPUT_VALUE)
+        container_params = SqlContainerCreateUpdateParameters(
+            resource=container_resource, options=throughput_opts
+        )
 
         for attempt in range(max_retries):
             try:
@@ -568,26 +580,6 @@ def create_database_and_container_via_management(credential, source_specs: List[
                 break
             except Exception as e:
                 error_str = str(e)
-                if (
-                    "Vector Indexing is not supported for shared throughput offer" in error_str
-                    and not tried_dedicated_autoscale
-                ):
-                    if THROUGHPUT_MODE == "autoscale":
-                        throughput_opts = CreateUpdateOptions(
-                            autoscale_settings=AutoscaleSettings(max_throughput=THROUGHPUT_VALUE)
-                        )
-                    else:
-                        throughput_opts = CreateUpdateOptions(throughput=THROUGHPUT_VALUE)
-                    print(
-                        f"  ⚠ Shared throughput doesn't support vector indexing for this container; "
-                        f"retrying with dedicated {THROUGHPUT_MODE} throughput ({THROUGHPUT_VALUE} RU)..."
-                    )
-                    container_params = SqlContainerCreateUpdateParameters(
-                        resource=container_resource,
-                        options=throughput_opts
-                    )
-                    tried_dedicated_autoscale = True
-                    continue
                 if "Conflict" in error_str or "already exists" in error_str.lower():
                     print(f"  ✓ Container '{container_name}' already exists - using as-is (no settings update)")
                     break
@@ -738,15 +730,38 @@ def _load_jsonl_documents(jsonl_path: str) -> list[dict[str, Any]]:
     return documents
 
 
-async def upload_document(container, doc: Dict[str, Any]) -> bool:
-    """Upload a single document to Cosmos DB."""
-    try:
-        await container.upsert_item(doc)
-        return True
-    except exceptions.CosmosHttpResponseError as e:
-        doc_id = doc["id"] if "id" in doc else "unknown"
-        print(f"Error uploading document {doc_id}: {e}")
-        return False
+async def upload_document(container, doc: Dict[str, Any], max_retries: int = 5) -> bool:
+    """Upload a single document to Cosmos DB with retry + backoff for 429s and transient errors."""
+    doc_id = doc.get("id", "unknown")
+    for attempt in range(max_retries):
+        try:
+            await container.upsert_item(doc)
+            return True
+        except exceptions.CosmosHttpResponseError as e:
+            if e.status_code == 429 and attempt < max_retries - 1:
+                retry_after = float(e.headers.get("x-ms-retry-after-ms", 0)) / 1000.0
+                wait = max(retry_after, 0.5 * (2 ** attempt))
+                await asyncio.sleep(wait)
+                continue
+            print(f"Error uploading document {doc_id}: {e}")
+            return False
+        except (ConnectionError, TimeoutError, OSError) as e:
+            if attempt < max_retries - 1:
+                wait = 1.0 * (2 ** attempt)
+                await asyncio.sleep(wait)
+                continue
+            print(f"Error uploading document {doc_id} (transient after {max_retries} retries): {e}")
+            return False
+        except Exception as e:
+            err_name = type(e).__name__
+            if ("Incomplete" in err_name or "Payload" in err_name or "Transfer" in err_name
+                    or "ServiceRequest" in err_name) and attempt < max_retries - 1:
+                wait = 1.0 * (2 ** attempt)
+                await asyncio.sleep(wait)
+                continue
+            print(f"Error uploading document {doc_id}: {e}")
+            return False
+    return False
 
 
 async def upload_documents_batch(container, docs: List[Dict[str, Any]]) -> tuple[int, int]:
@@ -763,6 +778,51 @@ async def upload_documents_batch(container, docs: List[Dict[str, Any]]) -> tuple
     results = await asyncio.gather(*(_upload(item) for item in docs))
     success_count = sum(1 for result in results if result)
     return success_count, len(results) - success_count
+
+
+async def _embed_and_upload_batch(
+    batch_docs: list[dict],
+    embed_client,
+    container,
+    embedding_field: str,
+    text_fields: list[str],
+    max_embed_retries: int = 5,
+) -> tuple[int, int, float, float]:
+    """Embed + upload a single batch with retry for rate-limit errors."""
+    batch_texts = [generate_embedding_text(d, text_fields) for d in batch_docs]
+    embed_secs = upload_secs = 0.0
+
+    embeddings = None
+    for attempt in range(max_embed_retries):
+        try:
+            t0 = time.perf_counter()
+            embeddings = await generate_embeddings_batch(embed_client, batch_texts)
+            embed_secs += time.perf_counter() - t0
+            break
+        except Exception as e:
+            embed_secs += time.perf_counter() - t0
+            err_str = str(e)
+            err_name = type(e).__name__
+            is_rate_limit = "429" in err_str or "RateLimitReached" in err_str or "rate" in err_str.lower()
+            is_transient = ("Incomplete" in err_name or "Payload" in err_name
+                            or "Transfer" in err_name or "ServiceRequest" in err_name
+                            or isinstance(e, (ConnectionError, TimeoutError, OSError)))
+            if (is_rate_limit or is_transient) and attempt < max_embed_retries - 1:
+                wait = 2 * (2 ** attempt)
+                await asyncio.sleep(wait)
+                continue
+            print(f"\nError embedding batch: {e}")
+            return 0, len(batch_docs), embed_secs, upload_secs
+
+    if embeddings is None:
+        return 0, len(batch_docs), embed_secs, upload_secs
+
+    for doc, emb in zip(batch_docs, embeddings):
+        doc[embedding_field] = emb
+    t0 = time.perf_counter()
+    sc, fc = await upload_documents_batch(container, batch_docs)
+    upload_secs = time.perf_counter() - t0
+    return sc, fc, embed_secs, upload_secs
 
 
 async def main_async():
@@ -850,8 +910,22 @@ async def main_async():
         print("No upload targets configured. Nothing to upload.")
         return
 
-    print("\n🔌 Initializing clients...")
+    # Ensure the Cosmos DB account exists before connecting data plane
     use_rbac_auth = CONFIG.get("cosmos", {}).get("use_rbac_auth", False)
+    if AZURE_SUBSCRIPTION_ID and COSMOS_RESOURCE_GROUP:
+        print("\n📦 Ensuring Cosmos DB account and containers exist…")
+        mgmt_credential = SyncDefaultAzureCredential()
+        account_name = COSMOS_ACCOUNT_NAME or extract_account_name_from_endpoint(COSMOS_ENDPOINT)
+        from utils.cosmos_account import ensure_cosmos_account_exists
+        ensure_cosmos_account_exists(
+            mgmt_credential, AZURE_SUBSCRIPTION_ID, COSMOS_RESOURCE_GROUP, account_name,
+        )
+        try:
+            create_database_and_container_via_management(mgmt_credential, upload_targets)
+        except Exception as e:
+            print(f"⚠ Container auto-create failed: {e}")
+
+    print("\n🔌 Initializing clients...")
     data_plane_credential = AsyncDefaultAzureCredential() if use_rbac_auth else None
     cosmos_client = get_cosmos_client(use_rbac_auth=use_rbac_auth, credential=data_plane_credential)
 
@@ -868,24 +942,6 @@ async def main_async():
             return True
         except exceptions.CosmosResourceNotFoundError:
             return False
-
-    missing_target_specs = [
-        target
-        for target in upload_targets
-        if not await container_exists_data_plane_async(target["container_name"])
-    ]
-
-    if missing_target_specs:
-        if AZURE_SUBSCRIPTION_ID and COSMOS_RESOURCE_GROUP:
-            try:
-                credential = SyncDefaultAzureCredential()
-                print("\n📦 Missing containers detected; attempting management-plane create...")
-                create_database_and_container_via_management(credential, missing_target_specs)
-            except Exception as e:
-                print(f"⚠ Container auto-create failed: {e}")
-        else:
-            print("\n⚠ Missing containers detected, but management settings are incomplete.")
-            print("   Set cosmos.azure_subscription_id and cosmos.cosmos_resource_group to auto-create missing containers.")
 
     upload_targets_ready = []
     for target in upload_targets:
@@ -942,23 +998,63 @@ async def main_async():
 
             if document_parser_fn:
                 # Custom parser (e.g. XML → dict) — stream in batches
+                # Use iglob for memory-efficient iteration over millions of files
                 if file_glob_pattern:
-                    input_files = sorted(glob_mod.glob(
+                    file_iter = glob_mod.iglob(
                         os.path.join(documents_root, file_glob_pattern), recursive=True,
-                    ))
+                    )
                 else:
-                    input_files = await asyncio.to_thread(find_all_input_files, documents_root)
-                total_files_seen += len(input_files)
-                print(f"\n🔍 Scanning ({target_name}): {documents_root}  "
-                      f"[parser={parser_spec}, glob={file_glob_pattern or '*'}]")
-                print(f"✓ Found {len(input_files)} files")
-                if not input_files:
-                    print(f"⚠ No files found for {target_name}. Skipping.")
-                    continue
+                    def _walk_files(base: str):
+                        for root, dirs, files in os.walk(base):
+                            dirs[:] = [d for d in dirs if not d.startswith('.')]
+                            for f in files:
+                                if not f.startswith('.'):
+                                    yield os.path.join(root, f)
+                    file_iter = _walk_files(documents_root)
 
-                print(f"\n📄 Processing {target_name} documents (batch size: {batch_size})...")
+                print(f"\n🔍 Streaming ({target_name}): {documents_root}  "
+                      f"[parser={parser_spec}, glob={file_glob_pattern or '*'}]")
+
+                print(f"\n📄 Processing {target_name} documents "
+                      f"(batch size: {batch_size}, concurrent batches: {CONCURRENT_BATCHES})...")
                 batch_queue: list[dict] = []
-                for file_path in tqdm(input_files, desc=f"Processing {target_name}"):
+                in_flight: set[asyncio.Task] = set()
+                batch_sem = asyncio.Semaphore(max(1, CONCURRENT_BATCHES))
+                files_processed = 0
+
+                def _collect_completed() -> None:
+                    nonlocal successful_uploads, failed_uploads
+                    nonlocal total_embed_seconds, total_upload_seconds
+                    done = {t for t in in_flight if t.done()}
+                    for t in done:
+                        in_flight.discard(t)
+                        try:
+                            sc, fc, es, us = t.result()
+                        except Exception as exc:
+                            print(f"\n⚠ Batch task failed unexpectedly: {exc}")
+                            failed_uploads += batch_size
+                            continue
+                        successful_uploads += sc
+                        failed_uploads += fc
+                        total_embed_seconds += es
+                        total_upload_seconds += us
+
+                async def _submit_batch(batch: list[dict]) -> None:
+                    """Acquire semaphore (blocking if all slots full), then launch task."""
+                    _collect_completed()
+                    await batch_sem.acquire()
+                    task = asyncio.create_task(
+                        _embed_and_upload_batch(
+                            batch, embed_client, container, embedding_field, text_fields,
+                        )
+                    )
+                    def _on_done(t: asyncio.Task) -> None:
+                        batch_sem.release()
+                    task.add_done_callback(_on_done)
+                    in_flight.add(task)
+
+                for file_path in file_iter:
+                    files_processed += 1
                     parse_start = time.perf_counter()
                     doc = document_parser_fn(file_path)
                     total_parse_seconds += (time.perf_counter() - parse_start)
@@ -968,40 +1064,25 @@ async def main_async():
                     batch_queue.append(doc)
 
                     if len(batch_queue) >= batch_size:
-                        batch_texts = [generate_embedding_text(d, text_fields) for d in batch_queue]
-                        try:
-                            embed_start = time.perf_counter()
-                            embeddings = await generate_embeddings_batch(embed_client, batch_texts)
-                            total_embed_seconds += (time.perf_counter() - embed_start)
-                            for item_doc, emb in zip(batch_queue, embeddings):
-                                item_doc[embedding_field] = emb
-                            upload_start = time.perf_counter()
-                            sc, fc = await upload_documents_batch(container, batch_queue)
-                            total_upload_seconds += (time.perf_counter() - upload_start)
-                            successful_uploads += sc
-                            failed_uploads += fc
-                        except Exception as e:
-                            print(f"\nError processing {target_name} batch: {e}")
-                            failed_uploads += len(batch_queue)
+                        await _submit_batch(list(batch_queue))
                         batch_queue.clear()
+                        if files_processed % 5000 == 0:
+                            _collect_completed()
+                            print(f"  … {files_processed:,} files parsed, "
+                                  f"{successful_uploads:,} uploaded, "
+                                  f"{len(in_flight)} batches in flight")
 
-                # Flush remaining
+                total_files_seen += files_processed
+
+                # Flush remaining docs
                 if batch_queue:
-                    batch_texts = [generate_embedding_text(d, text_fields) for d in batch_queue]
-                    try:
-                        embed_start = time.perf_counter()
-                        embeddings = await generate_embeddings_batch(embed_client, batch_texts)
-                        total_embed_seconds += (time.perf_counter() - embed_start)
-                        for item_doc, emb in zip(batch_queue, embeddings):
-                            item_doc[embedding_field] = emb
-                        upload_start = time.perf_counter()
-                        sc, fc = await upload_documents_batch(container, batch_queue)
-                        total_upload_seconds += (time.perf_counter() - upload_start)
-                        successful_uploads += sc
-                        failed_uploads += fc
-                    except Exception as e:
-                        print(f"\nError processing {target_name} batch: {e}")
-                        failed_uploads += len(batch_queue)
+                    await _submit_batch(list(batch_queue))
+                    batch_queue.clear()
+
+                # Wait for all in-flight batches
+                if in_flight:
+                    await asyncio.gather(*in_flight)
+                    _collect_completed()
                 continue
             else:
                 # Default: directory of JSON files
@@ -1033,26 +1114,40 @@ async def main_async():
             print(f"⚠ No documents loaded for {target_name}. Skipping.")
             continue
 
-        print(f"\n📄 Processing {target_name} documents (batch size: {batch_size})...")
+        print(f"\n📄 Processing {target_name} documents "
+              f"(batch size: {batch_size}, concurrent batches: {CONCURRENT_BATCHES})...")
+
+        batch_sem = asyncio.Semaphore(max(1, CONCURRENT_BATCHES))
+        in_flight: list[asyncio.Task] = []
+
+        async def _dispatch(batch: list[dict]) -> None:
+            async with batch_sem:
+                return await _embed_and_upload_batch(
+                    batch, embed_client, container, embedding_field, text_fields,
+                )
 
         for i in range(0, len(all_docs), batch_size):
             batch_docs = all_docs[i:i + batch_size]
-            batch_texts = [generate_embedding_text(doc, text_fields) for doc in batch_docs]
-            try:
-                embed_start = time.perf_counter()
-                embeddings = await generate_embeddings_batch(embed_client, batch_texts)
-                total_embed_seconds += (time.perf_counter() - embed_start)
-                for item_doc, embedding in zip(batch_docs, embeddings):
-                    item_doc[embedding_field] = embedding
+            # Collect completed tasks
+            done = [t for t in in_flight if t.done()]
+            for t in done:
+                in_flight.remove(t)
+                sc, fc, es, us = t.result()
+                successful_uploads += sc
+                failed_uploads += fc
+                total_embed_seconds += es
+                total_upload_seconds += us
+            task = asyncio.create_task(_dispatch(batch_docs))
+            in_flight.append(task)
 
-                upload_start = time.perf_counter()
-                success_count, failed_count = await upload_documents_batch(container, batch_docs)
-                total_upload_seconds += (time.perf_counter() - upload_start)
-                successful_uploads += success_count
-                failed_uploads += failed_count
-            except Exception as e:
-                print(f"\nError processing {target_name} batch: {e}")
-                failed_uploads += len(batch_docs)
+        if in_flight:
+            await asyncio.gather(*in_flight)
+            for t in in_flight:
+                sc, fc, es, us = t.result()
+                successful_uploads += sc
+                failed_uploads += fc
+                total_embed_seconds += es
+                total_upload_seconds += us
 
     # Summary
     print("\n" + "=" * 60)

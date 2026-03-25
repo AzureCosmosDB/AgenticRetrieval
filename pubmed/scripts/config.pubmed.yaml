@@ -16,34 +16,35 @@
 # Embedding settings (Azure OpenAI)
 # ---------------------------------------------------------------------------
 embedding:
-  embed_endpoint: ""                        # e.g. https://<resource>.openai.azure.com
+  embed_endpoint: ""
   api_version: "2024-05-01-preview"
   embed_model: "text-embedding-3-small"
   embed_dimensions: 1536
-  embed_api_key: ""                         # or use RBAC below
-  # use_rbac_auth: true
-  # token_scope: "https://cognitiveservices.azure.com/.default"
+  embed_cache_size: 4096
+  use_rbac_auth: false
+  embed_api_key: ""
+  token_scope: "https://cognitiveservices.azure.com/.default"
 
 # ---------------------------------------------------------------------------
 # Cosmos DB settings
 # ---------------------------------------------------------------------------
 cosmos:
-  uri: ""                                   # e.g. https://<account>.documents.azure.com:443/
+  # Upload settings used by cosmos_db_upload.py
+  cosmos_account_name: ""
+  cosmos_resource_group: ""
+  azure_subscription_id: ""
+  uri: ""
   key: ""                                   # leave empty when using RBAC
   database_name: "pubmed"
   use_rbac_auth: true
-
-  # Management-plane credentials (needed to auto-create database + containers)
-  cosmos_account_name: ""                   # e.g. my-cosmos-account
-  cosmos_resource_group: ""
-  azure_subscription_id: ""
 
   # Throughput tuning
   throughput_mode: "autoscale"        # "autoscale" or "manual"
   throughput_value: 60000             # max RU/s for autoscale
 
   # Upload tuning
-  embedding_batch_size: 50
+  embedding_batch_size: 30
+  concurrent_batches: 5                     # number of embed+upload batches in flight at once
 
   # Vector embedding policy applied to all sources below
   vector_embedding_policy_json: |
@@ -70,7 +71,7 @@ cosmos:
       # Custom parser: parse JATS XML files instead of JSON
       document_parser: "pubmed/scripts/parse_article.py:parse_article"
       file_glob: "**/*.xml"
-      documents_root: "pubmed/downloads/temp"   # directory of extracted XML files
+      documents_root: "pubmed/downloads"   # directory of extracted XML files
 
       # Fields concatenated to build embedding input text
       embedding_text_fields:
