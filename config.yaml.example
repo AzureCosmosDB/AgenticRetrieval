@@ -11,6 +11,20 @@ retrieval:
   rescale_power: 5.0  # Query-similarity rescale power
   cache_size: 2000
 
+# Semantic ranker (reranking after diversity selection)
+ranker:
+  use_ranker: false
+  k_ranker: 20
+  region: ""
+  account_name: ""
+  read_token_from_path: false
+  access_token_path: "access_token.txt"
+  tenant_id: ""
+  token_scope: ""
+  register_account_path: ""
+  batch_size: 32
+  max_retries: 5
+
 # Pipeline parameters
 pipeline:
   max_sub_questions: 5

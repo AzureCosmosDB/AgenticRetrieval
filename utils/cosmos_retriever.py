@@ -9,6 +9,7 @@ import time
 import warnings
 from typing import Any
 
+import httpx
 import numpy as np
 from azure.cosmos.aio import CosmosClient
 from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential, DefaultAzureCredential
@@ -100,11 +101,13 @@ class CombinedRetriever:
         retrieval_sources: list[dict[str, Any]],
         fulltext_k_override: int | None = None,
         k_diverse: int = 0,
+        k_ranker: int = 0,
         eta: float = 0.0,
         rescale_power: float = 0.0,
         cosmos_az_login: bool = False,
     ):
         self.k_diverse = k_diverse
+        self.k_ranker = k_ranker
         self.eta = eta
         self.rescale_power = rescale_power
         self._cosmos_az_login = cosmos_az_login
@@ -116,6 +119,27 @@ class CombinedRetriever:
         self._credential = None
         self._retrieve_cache = LRUCache(int(CONFIG.get("retrieval", {}).get("cache_size", 2000)))
         self._sources = self._normalize_sources(retrieval_sources, fulltext_k_override)
+        self._ranker_http_client: httpx.AsyncClient | None = None
+        ranker_cfg = CONFIG.get("ranker", {})
+        self._use_ranker = bool(ranker_cfg.get("use_ranker", False))
+        self._ranker_region = str(ranker_cfg.get("region", "")).strip()
+        self._ranker_account = str(ranker_cfg.get("account_name", "")).strip()
+        self._ranker_batch_size = int(ranker_cfg.get("batch_size", 32))
+        self._ranker_access_token: str | None = None
+        if self._use_ranker:
+            read_token_from_path = bool(ranker_cfg.get("read_token_from_path", True))
+            if read_token_from_path:
+                token_path = str(ranker_cfg.get("access_token_path", "access_token.txt")).strip()
+                if token_path and os.path.isfile(token_path):
+                    with open(token_path, "r") as f:
+                        self._ranker_access_token = f.read().strip()
+            else:
+                from azure.identity import AzureCliCredential as SyncAzureCliCredential
+                tenant_id = str(ranker_cfg.get("tenant_id", "")).strip()
+                token_scope = str(ranker_cfg.get("token_scope", "")).strip()
+                credential = SyncAzureCliCredential(tenant_id=tenant_id) if tenant_id else SyncAzureCliCredential()
+                token_obj = credential.get_token(token_scope)
+                self._ranker_access_token = token_obj.token
 
     @property
     def total_fulltext_k(self) -> int:
@@ -190,6 +214,29 @@ class CombinedRetriever:
         for source in self._sources:
             self._containers[source["id"]] = self._db.get_container_client(source["container_name"])
         self._llm = LLMClient()
+
+        # Register ranker account (idempotent – safe to call every time)
+        if self._use_ranker and self._ranker_account and self._ranker_access_token:
+            if self._ranker_http_client is None:
+                self._ranker_http_client = httpx.AsyncClient(timeout=120)
+            register_account_path = str(CONFIG.get("ranker", {}).get("register_account_path", "")).strip()
+            register_url = f"https://{self._ranker_region}.{register_account_path}"
+            register_payload = {
+                "AccountName": self._ranker_account,
+                "Region": self._ranker_region,
+            }
+            register_headers = {
+                "Authorization": f"Bearer {self._ranker_access_token}",
+                "Content-Type": "application/json",
+            }
+            try:
+                resp = await self._ranker_http_client.post(register_url, headers=register_headers, json=register_payload)
+                if resp.status_code == 200:
+                    _log_line(f"✓ Ranker account '{self._ranker_account}' registered", kind="success")
+                else:
+                    _log_line(f"Ranker account registration returned {resp.status_code}: {resp.text[:200]}", kind="warn")
+            except Exception as e:
+                _log_line(f"Ranker account registration failed: {e}", kind="warn")
 
     async def _fulltext_search(self, container, fields: list[str], query: str, top_k: int) -> list[dict]:
         if top_k <= 0 or not fields:
@@ -439,6 +486,51 @@ class CombinedRetriever:
             chunks = [chunks[i] for i in selected]
             _ck(f"  retrieve: greedy log-det – done (selected {len(chunks)} of {self.k_diverse} requested)", t)
 
+        # Semantic ranker reranking
+        effective_k_ranker = self.k_ranker // k_divisor
+        if self.k_ranker > 0 and self._use_ranker and len(chunks) > effective_k_ranker and self._ranker_account and self._ranker_access_token:
+            t = _ck("  retrieve: semantic ranker – start")
+            if self._ranker_http_client is None:
+                self._ranker_http_client = httpx.AsyncClient(timeout=120)
+            documents = [c.text for c in chunks]
+            body = {
+                "query": query,
+                "documents": documents,
+                "return_documents": False,
+                "top_k": effective_k_ranker,
+                "batch_size": self._ranker_batch_size,
+            }
+            headers = {
+                "Authorization": f"Bearer {self._ranker_access_token}",
+                "Content-Type": "application/json",
+            }
+            url = f"https://{self._ranker_account}.{self._ranker_region}.dbinference.azure.com:443/inference/semanticReranking"
+            max_retries = int(CONFIG.get("ranker", {}).get("max_retries", 5))
+            for attempt in range(max_retries):
+                try:
+                    response = await self._ranker_http_client.post(url, headers=headers, json=body)
+                    if response.status_code in (502, 503, 429) and attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        _log_line(f"Semantic ranker returned {response.status_code}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})", kind="warn")
+                        await asyncio.sleep(wait)
+                        continue
+                    response.raise_for_status()
+                    result = response.json()
+                    scores = result.get("Scores", [])
+                    # Select top k_ranker by reranker score, preserving original chunk objects
+                    ranked_indices = [s["index"] for s in scores[:self.k_ranker]]
+                    chunks = [chunks[i] for i in ranked_indices]
+                    _ck(f"  retrieve: semantic ranker – done (selected {len(chunks)} of {self.k_ranker} requested)", t)
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1 and ("503" in str(e) or "502" in str(e) or "429" in str(e)):
+                        wait = 2 ** attempt
+                        _log_line(f"Semantic ranker error (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait}s", kind="warn")
+                        await asyncio.sleep(wait)
+                        continue
+                    _log_line(f"Semantic ranker error: {e}", kind="error")
+                _ck("  retrieve: semantic ranker – failed, keeping diversity-selected chunks", t)
+
         self._retrieve_cache.set(cache_key, copy.deepcopy(chunks))
         
         _ck(f"retrieve – TOTAL ({len(chunks)} chunks returned)", t_retrieve)
@@ -454,3 +546,6 @@ class CombinedRetriever:
         if self._credential is not None:
             await self._credential.close()
             self._credential = None
+        if self._ranker_http_client is not None:
+            await self._ranker_http_client.aclose()
+            self._ranker_http_client = None

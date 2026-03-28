@@ -26,7 +26,7 @@ import yaml
 
 import openai
 from azure.cosmos.aio import CosmosClient
-from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential, get_bearer_token_provider
+from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential, AzureCliCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
 from tqdm import tqdm
@@ -307,11 +307,12 @@ class RoundResult:
 # =============================================================================
 
 class LLMClient:
-    def __init__(self):
+    def __init__(self, azure_az_login: bool = False):
         llm_cfg = CONFIG["llm"]
         # Embedding config: 'embedding' section overrides 'llm' section for backward compatibility
         embed_cfg = {**llm_cfg, **CONFIG.get("embedding", {})}
-        self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"])
+        self._azure_az_login = azure_az_login
+        self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"]) or azure_az_login
         token_scope = llm_cfg.get("token_scope")
         if not token_scope or not str(token_scope).strip():
             token_scope = "https://cognitiveservices.azure.com/.default"
@@ -323,7 +324,8 @@ class LLMClient:
         self._api_key = _shared_key
         self._token_provider = None
         if self._use_rbac_auth:
-            self._token_provider = get_bearer_token_provider(SyncDefaultAzureCredential(), self._token_scope)
+            credential = AzureCliCredential() if self._azure_az_login else SyncDefaultAzureCredential()
+            self._token_provider = get_bearer_token_provider(credential, self._token_scope)
         self._llm_client = None
         self._embed_client = None
         self._embed_http_client = None
@@ -351,6 +353,7 @@ class LLMClient:
         self._max_output_tokens_hint: int | None = None
         self._introspection_done = False
         self._introspection_lock = asyncio.Lock()
+        self.total_prompt_chars = 0
 
     @staticmethod
     def _is_key_auth_disabled_error(error: Exception) -> bool:
@@ -366,7 +369,8 @@ class LLMClient:
 
     def _switch_to_rbac_auth(self) -> None:
         self._use_rbac_auth = True
-        self._token_provider = get_bearer_token_provider(SyncDefaultAzureCredential(), self._token_scope)
+        credential = AzureCliCredential() if self._azure_az_login else SyncDefaultAzureCredential()
+        self._token_provider = get_bearer_token_provider(credential, self._token_scope)
         self._llm_client = None
         self._embed_client = None
 
@@ -705,8 +709,12 @@ class LLMClient:
             try:
                 return await self._complete_premium_once(prompt, label, max_completion_tokens)
             except InvalidLLMResponseError as e:
-                _log_line(f"Invalid LLM response on {label}: {e}", kind="warn")
-                raise
+                _log_line(f"Invalid LLM response on {label}: {e} ({attempt + 1}/{retries})", kind="warn")
+                if attempt + 1 >= retries:
+                    raise
+                wait = min(2.0 * (2 ** attempt), 30.0)
+                _log_line(f"Retrying {label} in {wait}s after invalid response", kind="warn")
+                await asyncio.sleep(wait)
             except openai.RateLimitError:
                 wait = min(5.0 * (2 ** attempt), 5.0 * (2 ** 8))
                 _log_line(f"Rate limited, retry in {wait}s ({attempt + 1}/{retries})", kind="warn")
@@ -714,7 +722,7 @@ class LLMClient:
             except openai.BadRequestError as e:
                 error_text = str(e)
                 self._update_hints_from_badrequest(error_text)
-                err_text = str(e).lower()
+                err_text = error_text.lower()
                 prior_completion_tokens = max_completion_tokens
                 max_completion_tokens = self._effective_max_completion_tokens(max_completion_tokens)
                 prompt_limit = self._effective_prompt_char_limit(max_completion_tokens)
@@ -779,6 +787,7 @@ class LLMClient:
     async def complete(self, prompt: str, retries: int | None = None, label: str = "LLM complete") -> str:
         if retries is None:
             retries = int(self._cfg["max_retries"])
+        self.total_prompt_chars += len(prompt)
 
         use_local_fallback = self._should_use_local_fallback(label)
         premium_configured = self._is_premium_configured()
@@ -1182,6 +1191,7 @@ async def main_async():
         help="Optional override for fulltext_k across all configured sources",
     )
     parser.add_argument("--k-diverse", type=int, default=CONFIG["retrieval"]["k_diverse"], help="Diverse chunks to select via log-det (0=disabled)")
+    parser.add_argument("--k-ranker", type=int, default=CONFIG.get("ranker", {}).get("k_ranker", 0), help="Rerank k_diverse chunks down to k_ranker via semantic ranker (0=disabled)")
     parser.add_argument("--eta", type=float, default=CONFIG["retrieval"]["eta"], help="Gram matrix regularization")
     parser.add_argument("--rescale-power", type=float, default=CONFIG["retrieval"]["rescale_power"], help="Query-similarity rescale power")
     parser.add_argument("--max-sub-questions", type=int, default=pipeline_cfg.get("max_sub_questions", 5))
@@ -1194,6 +1204,7 @@ async def main_async():
     parser.add_argument("--output-root", type=Path, default=Path(CONFIG["paths"]["output_root"]))
     parser.add_argument("--timing", action="store_true", help="Print timing checkpoints for each major operation")
     parser.add_argument("--cosmos-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Cosmos DB")
+    parser.add_argument("--azure-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Azure OpenAI LLM")
     parser.add_argument("--efficient", action="store_true", help="Use efficient pipeline: each round retrieves k/#subquestions per sub-question, combines results, and regenerates the answer")
     args = parser.parse_args()
 
@@ -1205,6 +1216,7 @@ async def main_async():
         retrieval_sources=RETRIEVAL_SOURCES,
         fulltext_k_override=args.k_fulltext,
         k_diverse=args.k_diverse,
+        k_ranker=args.k_ranker,
         eta=args.eta,
         rescale_power=args.rescale_power,
         cosmos_az_login=args.cosmos_az_login,
@@ -1214,7 +1226,7 @@ async def main_async():
     total_k = total_fulltext_k + total_vector_k
     _log_line(
         f"Decomposed RAG: sources={retriever.source_count}, "
-        f"fulltext_total={total_fulltext_k}, vector_total={total_vector_k}, diverse={args.k_diverse}"
+        f"fulltext_total={total_fulltext_k}, vector_total={total_vector_k}, diverse={args.k_diverse}, ranker={args.k_ranker}"
         ,
         kind="info"
     )
@@ -1224,7 +1236,7 @@ async def main_async():
     t = _ck("retriever.initialize – start")
     await retriever.initialize()
     _ck("retriever.initialize – done", t)
-    llm = LLMClient()
+    llm = LLMClient(azure_az_login=args.azure_az_login)
     pipeline = DecomposedRAGPipeline(
         retriever,
         llm,
@@ -1242,7 +1254,8 @@ async def main_async():
     _log_line(f"Processing {len(all_questions)} questions", kind="info")
     
     div_suffix = f"_div{args.k_diverse}" if args.k_diverse > 0 else ""
-    output_path = args.output_root / f"k{total_k}_ft{total_fulltext_k}_vec{total_vector_k}{div_suffix}"
+    ranker_suffix = f"_rank{args.k_ranker}" if args.k_ranker > 0 else ""
+    output_path = args.output_root / f"k{total_k}_ft{total_fulltext_k}_vec{total_vector_k}{div_suffix}{ranker_suffix}"
     output_path.mkdir(parents=True, exist_ok=True)
     
     results = []
@@ -1313,6 +1326,8 @@ async def main_async():
         _log_line(f"Done! Answers files ({len(written_answer_files)}):", kind="success")
         for file_path in written_answer_files:
             _log_line(f"  - {file_path}", kind="success")
+
+    _log_line(f"Total symbols passed to LLM: {llm.total_prompt_chars:,}", kind="info")
 
     await retriever.close()
     await llm.close()
