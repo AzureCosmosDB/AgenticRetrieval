@@ -488,7 +488,7 @@ class CombinedRetriever:
 
         # Semantic ranker reranking
         effective_k_ranker = self.k_ranker // k_divisor
-        if self.k_ranker > 0 and self._use_ranker and len(chunks) > effective_k_ranker and self._ranker_account and self._ranker_access_token:
+        if effective_k_ranker > 0 and self._use_ranker and len(chunks) > effective_k_ranker and self._ranker_account and self._ranker_access_token:
             t = _ck("  retrieve: semantic ranker – start")
             if self._ranker_http_client is None:
                 self._ranker_http_client = httpx.AsyncClient(timeout=120)
@@ -518,9 +518,9 @@ class CombinedRetriever:
                     result = response.json()
                     scores = result.get("Scores", [])
                     # Select top k_ranker by reranker score, preserving original chunk objects
-                    ranked_indices = [s["index"] for s in scores[:self.k_ranker]]
+                    ranked_indices = [s["index"] for s in scores[:effective_k_ranker]]
                     chunks = [chunks[i] for i in ranked_indices]
-                    _ck(f"  retrieve: semantic ranker – done (selected {len(chunks)} of {self.k_ranker} requested)", t)
+                    _ck(f"  retrieve: semantic ranker – done (selected {len(chunks)} of {effective_k_ranker} requested)", t)
                     break
                 except Exception as e:
                     if attempt < max_retries - 1 and ("503" in str(e) or "502" in str(e) or "429" in str(e)):
