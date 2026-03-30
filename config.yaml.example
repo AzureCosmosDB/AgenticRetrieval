@@ -19,9 +19,9 @@ ranker:
   account_name: ""
   read_token_from_path: false
   access_token_path: "access_token.txt"
-  tenant_id: ""
-  token_scope: ""
-  register_account_path: ""
+  tenant_id: "" # this is needed when read_token_from_path = false
+  token_scope: "" # this is needed when read_token_from_path = false
+  register_account_path: "" # this is needed when read_token_from_path = false
   batch_size: 32
   max_retries: 5
 
