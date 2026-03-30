@@ -21,6 +21,7 @@ Options
 
 Requirements
 ------------
+    Python 3.12+
     pip install requests tqdm
 """
 
@@ -34,6 +35,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
+
+if sys.version_info < (3, 12):
+    raise RuntimeError("Python 3.12 or later is required")
 
 import requests
 from tqdm import tqdm
@@ -325,7 +329,7 @@ def main() -> None:
         def _extract(archive: Path) -> str:
             extract_dir = archive.parent / archive.name.replace(".tar.gz", "")
             with tarfile.open(archive, "r:gz") as tar:
-                tar.extractall(path=extract_dir)
+                tar.extractall(path=extract_dir, filter="data")
             return archive.name
 
         extract_failed: list[str] = []
