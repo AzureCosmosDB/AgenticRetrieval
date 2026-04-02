@@ -26,7 +26,7 @@ import yaml
 
 import openai
 from azure.cosmos.aio import CosmosClient
-from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential, get_bearer_token_provider
+from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential, AzureCliCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
 from tqdm import tqdm
@@ -312,6 +312,7 @@ class LLMClient:
         # Embedding config: 'embedding' section overrides 'llm' section for backward compatibility
         embed_cfg = {**llm_cfg, **CONFIG.get("embedding", {})}
         self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"])
+        self._use_embed_rbac_auth = bool(embed_cfg.get("use_rbac_auth", False))
         token_scope = llm_cfg.get("token_scope")
         if not token_scope or not str(token_scope).strip():
             token_scope = "https://cognitiveservices.azure.com/.default"
@@ -322,8 +323,8 @@ class LLMClient:
         # Keep for backward compatibility
         self._api_key = _shared_key
         self._token_provider = None
-        if self._use_rbac_auth:
-            self._token_provider = get_bearer_token_provider(SyncDefaultAzureCredential(), self._token_scope)
+        if self._use_rbac_auth or self._use_embed_rbac_auth:
+            self._token_provider = get_bearer_token_provider(AzureCliCredential(), self._token_scope)
         self._llm_client = None
         self._embed_client = None
         self._embed_http_client = None
@@ -403,7 +404,7 @@ class LLMClient:
                 "api_version": self._embed_cfg["api_version"],
                 "azure_endpoint": self._embed_cfg["embed_endpoint"],
             }
-            if self._use_rbac_auth:
+            if self._use_embed_rbac_auth:
                 client_kwargs["azure_ad_token_provider"] = self._token_provider
             else:
                 if not self._embed_api_key:

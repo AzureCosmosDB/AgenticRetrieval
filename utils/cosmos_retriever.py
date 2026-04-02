@@ -191,20 +191,18 @@ class CombinedRetriever:
             self._containers[source["id"]] = self._db.get_container_client(source["container_name"])
         self._llm = LLMClient()
 
-    async def _fulltext_search(self, container, fields: list[str], query: str, top_k: int) -> list[dict]:
-        if top_k <= 0 or not fields:
-            return []
+    async def _fulltext_search_single_field(self, container, field: str, query: str, top_k: int) -> list[dict]:
+        """Run a fulltext search on a single field, returning ranked results."""
         terms = [t for t in re.findall(r"\w+", query) if t.lower() not in STOPWORDS and len(t) > 1]
         if not terms:
             return []
 
         chunks = [terms[i:i + 5] for i in range(0, len(terms), 5)]
-        score_exprs: list[str] = []
-        for field in fields:
-            field_expr = f"c.{field}"
-            for term_chunk in chunks:
-                args = ", ".join(f'"{term}"' for term in term_chunk)
-                score_exprs.append(f"FullTextScore({field_expr}, {args})")
+        field_expr = f"c.{field}"
+        score_exprs = []
+        for term_chunk in chunks:
+            args = ", ".join(f'"{term}"' for term in term_chunk)
+            score_exprs.append(f"FullTextScore({field_expr}, {args})")
         if not score_exprs:
             return []
 
@@ -213,26 +211,63 @@ class CombinedRetriever:
         else:
             order = f"ORDER BY RANK RRF({', '.join(score_exprs)})"
 
+        sql = f"SELECT TOP {top_k} * FROM c {order}"
         try:
-            sql = f"SELECT TOP {top_k} * FROM c {order}"
             if _timing_enabled():
                 _log_line(
-                    f"  fulltext SQL ({container.id}): {sql}  [text={query!r}]",
+                    f"  fulltext SQL ({container.id}/{field}): {sql}  [text={query!r}]",
                     kind="query",
                     use_lock=True,
                 )
 
-            t = _ck(f"fulltext query (top {top_k}, {container.id}) – start")
+            t = _ck(f"fulltext query (top {top_k}, {container.id}/{field}) – start")
             query_iterator = container.query_items(query=sql, parameters=[])
             items = []
             async for item in query_iterator:
                 items.append(item)
 
-            _ck(f"fulltext query – done ({len(items)} results, {container.id})", t)
+            _ck(f"fulltext query – done ({len(items)} results, {container.id}/{field})", t)
             return items
         except Exception as e:
-            _log_line(f"Fulltext error ({container.id}): {e}", kind="error")
+            _log_line(f"Fulltext error ({container.id}/{field}): {e}", kind="error")
             return []
+
+    async def _fulltext_search(self, container, fields: list[str], query: str, top_k: int) -> list[dict]:
+        if top_k <= 0 or not fields:
+            return []
+        terms = [t for t in re.findall(r"\w+", query) if t.lower() not in STOPWORDS and len(t) > 1]
+        if not terms:
+            return []
+
+        # Single field: run directly (no need for client-side RRF)
+        if len(fields) == 1:
+            return await self._fulltext_search_single_field(container, fields[0], query, top_k)
+
+        # Multiple fields: run parallel per-field queries and merge via client-side RRF
+        t = _ck(f"fulltext parallel-RRF (top {top_k}, {container.id}, {len(fields)} fields) – start")
+        per_field_tasks = [
+            asyncio.create_task(self._fulltext_search_single_field(container, field, query, top_k))
+            for field in fields
+        ]
+        per_field_results = await asyncio.gather(*per_field_tasks)
+
+        # Client-side RRF merge: score each doc by 1/(k+rank) across fields, pick top_k
+        rrf_k = 60  # standard RRF constant
+        doc_scores: dict[str, float] = {}
+        doc_map: dict[str, dict] = {}
+        for field_items in per_field_results:
+            for rank, item in enumerate(field_items):
+                doc_id = item.get("id", "")
+                if not doc_id:
+                    continue
+                doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+                if doc_id not in doc_map:
+                    doc_map[doc_id] = item
+
+        sorted_ids = sorted(doc_scores, key=lambda did: doc_scores[did], reverse=True)[:top_k]
+        merged = [doc_map[did] for did in sorted_ids]
+        _ck(f"fulltext parallel-RRF – done ({len(merged)} merged from {sum(len(r) for r in per_field_results)} total, {container.id})", t)
+        return merged
 
     async def _vector_search(
         self,
