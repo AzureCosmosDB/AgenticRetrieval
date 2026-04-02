@@ -14,7 +14,7 @@ retrieval:
 # Semantic ranker (reranking after diversity selection)
 ranker:
   use_ranker: false
-  k_ranker: 20
+  k_ranker: 40
   region: ""
   account_name: ""
   read_token_from_path: false
@@ -22,8 +22,9 @@ ranker:
   tenant_id: "" # this is needed when read_token_from_path = false
   token_scope: "" # this is needed when read_token_from_path = false
   register_account_path: "" # this is needed when read_token_from_path = false
-  batch_size: 32
-  max_retries: 5
+  url_suffix: ""
+  batch_size: 64
+  max_retries: 10
 
 # Pipeline parameters
 pipeline:
@@ -107,7 +108,7 @@ cosmos:
     }
 
   # Configure each source/container independently
-  # Retrieval in rag_divdet.py is derived from this `sources` list.
+  # Retrieval in agentic_retriever.py is derived from this `sources` list.
   sources:
     - id: "source_1"
       container_name: "container_1"

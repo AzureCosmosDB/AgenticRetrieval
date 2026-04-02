@@ -507,7 +507,8 @@ class CombinedRetriever:
                 "Authorization": f"Bearer {self._ranker_access_token}",
                 "Content-Type": "application/json",
             }
-            url = f"https://{self._ranker_account}.{self._ranker_region}.dbinference.azure.com:443/inference/semanticReranking"
+            url_suffix = str(CONFIG.get("ranker", {}).get("url_suffix", "dbinference.azure.com:443/inference/semanticReranking")).strip()
+            url = f"https://{self._ranker_account}.{self._ranker_region}.{url_suffix}"
             max_retries = int(CONFIG.get("ranker", {}).get("max_retries", 5))
             ranker_succeeded = False
             for attempt in range(max_retries):
