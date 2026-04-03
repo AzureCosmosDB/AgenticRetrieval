@@ -697,6 +697,7 @@ class LLMClient:
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
         self.total_llm_calls += 1
         if isinstance(prompt_tokens, int) and prompt_tokens > 0:
+            self.total_llm_calls += 1
             self.total_prompt_tokens += prompt_tokens
             observed = len(prompt) / float(prompt_tokens)
             observed = min(8.0, max(2.0, observed))
@@ -1333,7 +1334,7 @@ async def main_async():
     _log_line(f"Total symbols passed to LLM: {llm.total_prompt_chars:,}", kind="info")
     if llm.total_llm_calls > 0:
         avg_tokens = llm.total_prompt_tokens / llm.total_llm_calls
-        _log_line(f"Total prompt tokens: {llm.total_prompt_tokens:,} across {llm.total_llm_calls} LLM calls (avg {avg_tokens:,.0f} tokens/call)", kind="info")
+        _log_line(f"Total premium prompt tokens: {llm.total_prompt_tokens:,} across {llm.total_llm_calls} LLM calls (avg {avg_tokens:,.0f} tokens/call)", kind="info")
 
     await retriever.close()
     await llm.close()
