@@ -58,34 +58,23 @@ def _as_list_of_strings(value: Any) -> list[str]:
 
 
 def _get_source_config(config: dict[str, Any]) -> list[dict[str, Any]]:
-    cosmos_cfg = config.get("cosmos", {})
-    configured_sources = cosmos_cfg.get("sources")
-    if not isinstance(configured_sources, list):
-        raise ValueError(
-            "Invalid config: cosmos.sources must be a list with at least one source entry "
-            "(container_name, retrieval settings, etc.)."
-        )
-    if not configured_sources:
-        raise ValueError(
-            "Invalid config: cosmos.sources is empty. Add at least one source entry under cosmos.sources."
-        )
+    configured_sources = config["cosmos"]["sources"]
+    if not isinstance(configured_sources, list) or not configured_sources:
+        raise ValueError("Invalid config: cosmos.sources must be a non-empty list.")
 
     normalized_sources: list[dict[str, Any]] = []
     for idx, source in enumerate(configured_sources, start=1):
         source = source or {}
         retrieval_cfg = source.get("retrieval") or {}
-        source_id = str(source.get("id") or f"source_{idx}").strip()
-        normalized_sources.append(
-            {
-                "id": source_id,
-                "container_name": source.get("container_name"),
-                "partition_key_path": source.get("partition_key_path"),
-                "embedding_field": str(source.get("embedding_field") or "e").strip(),
-                "vector_k": int(retrieval_cfg.get("vector_k", 0) or 0),
-                "fulltext_k": int(retrieval_cfg.get("fulltext_k", 0) or 0),
-                "fulltext_fields": _as_list_of_strings(retrieval_cfg.get("fulltext_fields")),
-            }
-        )
+        normalized_sources.append({
+            "id": source["id"],
+            "container_name": source["container_name"],
+            "partition_key_path": source["partition_key_path"],
+            "embedding_field": source["embedding_field"],
+            "vector_k": int(retrieval_cfg["vector_k"]),
+            "fulltext_k": int(retrieval_cfg["fulltext_k"]),
+            "fulltext_fields": _as_list_of_strings(retrieval_cfg.get("fulltext_fields")),
+        })
     return normalized_sources
 
 
@@ -115,41 +104,39 @@ class CombinedRetriever:
         self._db = None
         self._containers: dict[str, Any] = {}
         self._llm = None
-        self._expected_vector_dim = int((CONFIG.get("embedding") or CONFIG.get("llm", {})).get("embed_dimensions") or 0)
+        self._expected_vector_dim = int(CONFIG["embedding"]["embed_dimensions"])
         self._credential = None
-        self._retrieve_cache = LRUCache(int(CONFIG.get("retrieval", {}).get("cache_size", 2000)))
+        self._retrieve_cache = LRUCache(int(CONFIG["retrieval"]["cache_size"]))
         self._sources = self._normalize_sources(retrieval_sources, fulltext_k_override)
         self._ranker_http_client: httpx.AsyncClient | None = None
-        ranker_cfg = CONFIG.get("ranker", {})
-        self._use_ranker = bool(ranker_cfg.get("use_ranker", False))
-        self._ranker_region = str(ranker_cfg.get("region", "")).strip()
-        self._ranker_account = str(ranker_cfg.get("account_name", "")).strip()
-        self._ranker_batch_size = int(ranker_cfg.get("batch_size", 32))
+        ranker_cfg = CONFIG["ranker"]
+        self._use_ranker = bool(ranker_cfg["use_ranker"])
+        self._ranker_region = ranker_cfg["region"]
+        self._ranker_account = ranker_cfg["account_name"]
+        self._ranker_batch_size = int(ranker_cfg["batch_size"])
         self._ranker_access_token: str | None = None
         if self._use_ranker:
-            read_token_from_path = bool(ranker_cfg.get("read_token_from_path", True))
-            if read_token_from_path:
-                token_path = str(ranker_cfg.get("access_token_path", "access_token.txt")).strip()
+            if ranker_cfg["read_token_from_path"]:
+                token_path = ranker_cfg["access_token_path"]
                 if token_path and os.path.isfile(token_path):
                     with open(token_path, "r") as f:
                         self._ranker_access_token = f.read().strip()
             else:
                 from azure.identity import AzureCliCredential as SyncAzureCliCredential
-                tenant_id = str(ranker_cfg.get("tenant_id", "")).strip()
-                token_scope = str(ranker_cfg.get("token_scope", "")).strip()
+                tenant_id = ranker_cfg["tenant_id"]
+                token_scope = ranker_cfg["token_scope"]
                 if not token_scope:
-                    raise ValueError("ranker.token_scope must be a non-empty string when read_token_from_path is false")
+                    raise ValueError("ranker.token_scope must be set when read_token_from_path is false")
                 credential = SyncAzureCliCredential(tenant_id=tenant_id) if tenant_id else SyncAzureCliCredential()
-                token_obj = credential.get_token(token_scope)
-                self._ranker_access_token = token_obj.token
+                self._ranker_access_token = credential.get_token(token_scope).token
 
     @property
     def total_fulltext_k(self) -> int:
-        return sum(int(source.get("fulltext_k", 0) or 0) for source in self._sources)
+        return sum(source["fulltext_k"] for source in self._sources)
 
     @property
     def total_vector_k(self) -> int:
-        return sum(int(source.get("vector_k", 0) or 0) for source in self._sources)
+        return sum(source["vector_k"] for source in self._sources)
 
     @property
     def source_count(self) -> int:
@@ -159,52 +146,45 @@ class CombinedRetriever:
     def _is_safe_field_path(path: str) -> bool:
         return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", path))
 
-    def _normalize_sources(
-        self,
-        retrieval_sources: list[dict[str, Any]],
-        fulltext_k_override: int | None,
-    ) -> list[dict[str, Any]]:
+    def _normalize_sources(self, retrieval_sources: list[dict[str, Any]], fulltext_k_override: int | None) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for idx, source in enumerate(retrieval_sources, start=1):
             source = source or {}
-            source_id = str(source.get("id") or f"source_{idx}").strip()
-            container_name = str(source.get("container_name") or "").strip()
+            container_name = source["container_name"]
             if not container_name:
                 continue
-            vector_k = int(source.get("vector_k", 0) or 0)
-            fulltext_k = int(source.get("fulltext_k", 0) or 0)
+            embedding_field = source["embedding_field"]
+            if not self._is_safe_field_path(embedding_field):
+                raise ValueError(f"Unsafe embedding field path in source '{source['id']}': {embedding_field!r}")
+            fulltext_k = int(source["fulltext_k"])
             if fulltext_k_override is not None:
                 fulltext_k = int(fulltext_k_override)
-            embedding_field = str(source.get("embedding_field") or "e").strip()
-            if not self._is_safe_field_path(embedding_field):
-                embedding_field = "e"
-            fulltext_fields = [
-                field for field in _as_list_of_strings(source.get("fulltext_fields")) if self._is_safe_field_path(field)
-            ]
-            normalized.append(
-                {
-                    "id": source_id,
-                    "container_name": container_name,
-                    "partition_key_path": str(source.get("partition_key_path") or "").strip(),
-                    "embedding_field": embedding_field,
-                    "vector_k": max(0, vector_k),
-                    "fulltext_k": max(0, fulltext_k),
-                    "fulltext_fields": fulltext_fields,
-                }
-            )
+            normalized.append({
+                "id": source["id"],
+                "container_name": container_name,
+                "partition_key_path": source["partition_key_path"],
+                "embedding_field": embedding_field,
+                "vector_k": max(0, int(source["vector_k"])),
+                "fulltext_k": max(0, fulltext_k),
+                "fulltext_fields": [f for f in _as_list_of_strings(source.get("fulltext_fields")) if self._is_safe_field_path(f)],
+            })
         return normalized
 
     async def initialize(self):
-        use_rbac_auth = CONFIG.get("cosmos", {}).get("use_rbac_auth", False)
+        use_rbac_auth = CONFIG["cosmos"].get("use_rbac_auth", False)
         if self._cosmos_az_login:
             credential = AsyncAzureCliCredential()
-            self._credential = credential
-            _log_line("✓ Using 'az login' (AzureCliCredential) authentication for Cosmos DB", kind="success")
-            self._cosmos = CosmosClient(COSMOS_ENDPOINT, credential=credential)
+            auth_desc = "'az login' (AzureCliCredential)"
         elif use_rbac_auth:
             credential = DefaultAzureCredential()
+            auth_desc = "Entra ID RBAC"
+        else:
+            credential = None
+            auth_desc = None
+
+        if credential:
             self._credential = credential
-            _log_line("✓ Using Entra ID RBAC authentication for Cosmos DB", kind="success")
+            _log_line(f"✓ Using {auth_desc} authentication for Cosmos DB", kind="success")
             self._cosmos = CosmosClient(COSMOS_ENDPOINT, credential=credential)
         else:
             if not COSMOS_KEY:
@@ -219,7 +199,7 @@ class CombinedRetriever:
 
         # Register ranker account (idempotent – safe to call every time)
         if self._use_ranker and self._ranker_account and self._ranker_access_token:
-            register_account_path = str(CONFIG.get("ranker", {}).get("register_account_path", "")).strip()
+            register_account_path = CONFIG["ranker"]["register_account_path"]
             if self._ranker_region and register_account_path:
                 if self._ranker_http_client is None:
                     self._ranker_http_client = httpx.AsyncClient(timeout=120)
@@ -331,15 +311,12 @@ class CombinedRetriever:
     ) -> list[dict]:
         if top_k <= 0:
             return []
-        vector_field = str(embedding_field or "e").strip()
+        vector_field = embedding_field
         if not self._is_safe_field_path(vector_field):
             raise ValueError(f"Unsafe embedding field path: {vector_field!r}")
         adjusted_emb = [float(x) for x in query_emb]
         if self._expected_vector_dim > 0:
-            if len(adjusted_emb) > self._expected_vector_dim:
-                adjusted_emb = adjusted_emb[:self._expected_vector_dim]
-            elif len(adjusted_emb) < self._expected_vector_dim:
-                adjusted_emb = adjusted_emb + [0.0] * (self._expected_vector_dim - len(adjusted_emb))
+            adjusted_emb = (adjusted_emb[:self._expected_vector_dim] + [0.0] * self._expected_vector_dim)[:self._expected_vector_dim]
         sql = (
             f"SELECT TOP @k c, VectorDistance(c.{vector_field}, @emb) AS score "
             f"FROM c ORDER BY VectorDistance(c.{vector_field}, @emb)"
@@ -398,13 +375,13 @@ class CombinedRetriever:
         return docs
     
     def _format_doc(self, doc: dict, source: str, embedding_field: str = "e") -> RetrievedChunk:
-        emb_field = str(embedding_field or "e").strip()
+        emb_field = embedding_field
         embedding = doc.get(emb_field) if isinstance(doc.get(emb_field), list) else doc.get('embedding')
         exclude = {'_rid', '_self', '_etag', '_attachments', '_ts', 'embedding', '_score', emb_field}
-        parts = []
-        for k, v in doc.items():
-            if k not in exclude and v:
-                parts.append(f"{k.replace('_', ' ').title()}: {v if not isinstance(v, (list, dict)) else str(v)}")
+        parts = [
+            f"{k.replace('_', ' ').title()}: {v if not isinstance(v, (list, dict)) else str(v)}"
+            for k, v in doc.items() if k not in exclude and v
+        ]
         return RetrievedChunk(
             chunk_id=doc.get('id', ''),
             text="\n".join(parts),
@@ -443,8 +420,8 @@ class CombinedRetriever:
             container = self._containers.get(source["id"])
             if container is None:
                 continue
-            top_k = int(source.get("fulltext_k", 0) or 0) // k_divisor
-            fields = source.get("fulltext_fields") or []
+            top_k = source["fulltext_k"] // k_divisor
+            fields = source["fulltext_fields"]
             if top_k <= 0 or not fields:
                 continue
             t_fulltext = _ck(f"  retrieve: fulltext/{source['id']} – start (parallel)")
@@ -452,7 +429,7 @@ class CombinedRetriever:
             fulltext_tasks.append(({"source": source, "timer": t_fulltext}, task))
 
         emb: list[float] | None = None
-        vector_sources = [source for source in self._sources if int(source.get("vector_k", 0) or 0) > 0]
+        vector_sources = [source for source in self._sources if source["vector_k"] > 0]
         if vector_sources:
             t_emb = _ck("  retrieve: embed query – start")
             emb = await self._llm.embed(query)
@@ -464,12 +441,12 @@ class CombinedRetriever:
                 container = self._containers.get(source["id"])
                 if container is None:
                     continue
-                vec_k = int(source.get("vector_k", 0) or 0) // k_divisor
+                vec_k = source["vector_k"] // k_divisor
                 t_vector = _ck(f"  retrieve: vector/{source['id']} – start (parallel)")
                 task = asyncio.create_task(
                     self._vector_search(
                         container,
-                        str(source.get("embedding_field") or "e"),
+                        source["embedding_field"],
                         emb,
                         vec_k,
                         query,
@@ -477,27 +454,20 @@ class CombinedRetriever:
                 )
                 vector_tasks.append(({"source": source, "timer": t_vector}, task))
 
-        for info, task in fulltext_tasks:
-            source = info["source"]
-            docs = await task
-            _ck(f"  retrieve: fulltext/{source['id']} – done ({len(docs)} results)", info["timer"])
-            for doc in docs:
-                dedupe_key = (source["id"], doc.get("id"))
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                chunks.append(self._format_doc(doc, f"{source['id']}_fulltext", str(source.get("embedding_field") or "e")))
+        async def _collect_results(tasks: list[tuple[dict[str, Any], asyncio.Task]], label: str) -> None:
+            for info, task in tasks:
+                source = info["source"]
+                docs = await task
+                _ck(f"  retrieve: {label}/{source['id']} – done ({len(docs)} results)", info["timer"])
+                emb_field = source["embedding_field"]
+                for doc in docs:
+                    dedupe_key = (source["id"], doc.get("id"))
+                    if dedupe_key not in seen:
+                        seen.add(dedupe_key)
+                        chunks.append(self._format_doc(doc, f"{source['id']}_{label}", emb_field))
 
-        for info, task in vector_tasks:
-            source = info["source"]
-            docs = await task
-            _ck(f"  retrieve: vector/{source['id']} – done ({len(docs)} results)", info["timer"])
-            for doc in docs:
-                dedupe_key = (source["id"], doc.get("id"))
-                if dedupe_key in seen:
-                    continue
-                seen.add(dedupe_key)
-                chunks.append(self._format_doc(doc, f"{source['id']}_vector", str(source.get("embedding_field") or "e")))
+        await _collect_results(fulltext_tasks, "fulltext")
+        await _collect_results(vector_tasks, "vector")
         
         # Diversity selection via greedy log-det maximization
         if self.k_diverse > 0 and len(chunks) > self.k_diverse:
@@ -544,9 +514,9 @@ class CombinedRetriever:
                 "Authorization": f"Bearer {self._ranker_access_token}",
                 "Content-Type": "application/json",
             }
-            url_suffix = str(CONFIG.get("ranker", {}).get("url_suffix", "")).strip()
+            url_suffix = CONFIG["ranker"]["url_suffix"]
             url = f"https://{self._ranker_account}.{self._ranker_region}.{url_suffix}"
-            max_retries = int(CONFIG.get("ranker", {}).get("max_retries", 5))
+            max_retries = int(CONFIG["ranker"]["max_retries"])
             ranker_succeeded = False
             for attempt in range(max_retries):
                 try:
@@ -566,7 +536,8 @@ class CombinedRetriever:
                     ranker_succeeded = True
                     break
                 except Exception as e:
-                    if attempt < max_retries - 1 and ("503" in str(e) or "502" in str(e) or "429" in str(e)):
+                    err_str = str(e)
+                    if attempt < max_retries - 1 and any(code in err_str for code in ("503", "502", "429")):
                         wait = 2 ** attempt
                         _log_line(f"Semantic ranker error (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait}s", kind="warn")
                         await asyncio.sleep(wait)
@@ -582,15 +553,11 @@ class CombinedRetriever:
         return chunks
 
     async def close(self):
-        if self._llm is not None:
-            await self._llm.close()
-            self._llm = None
-        if self._cosmos is not None:
-            await self._cosmos.close()
-            self._cosmos = None
-        if self._credential is not None:
-            await self._credential.close()
-            self._credential = None
+        for attr in ("_llm", "_cosmos", "_credential"):
+            client = getattr(self, attr, None)
+            if client is not None:
+                await client.close()
+                setattr(self, attr, None)
         if self._ranker_http_client is not None:
             await self._ranker_http_client.aclose()
             self._ranker_http_client = None

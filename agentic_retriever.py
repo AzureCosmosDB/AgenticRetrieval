@@ -251,25 +251,24 @@ def load_config(path: Path) -> None:
     global EFFICIENT_REGENERATE_PROMPT, EFFICIENT_SYNTHESIS_PROMPT
 
     preliminary_prefix = (str(CONFIG.get("pipeline", {}).get("preliminary_prefix")) or "").strip()
-    preliminary_prefix = preliminary_prefix + "\n\n" if preliminary_prefix else ""
     subquery_prefix = (str(CONFIG.get("pipeline", {}).get("subquery_prefix")) or "").strip()
-    subquery_prefix = subquery_prefix + "\n\n" if subquery_prefix else ""
-
-    PRELIMINARY_PROMPT = preliminary_prefix + PRELIMINARY_PROMPT
-    EFFICIENT_PRELIMINARY_PROMPT = preliminary_prefix + EFFICIENT_PRELIMINARY_PROMPT
-    EFFICIENT_REGENERATE_PROMPT = subquery_prefix + EFFICIENT_REGENERATE_PROMPT
-    SUBQUESTION_PROMPT = subquery_prefix + SUBQUESTION_PROMPT
-
     dataset_description = (str(CONFIG.get("pipeline", {}).get("dataset_description")) or "").strip()
-    dataset_description = dataset_description + "\n\n" if dataset_description else ""
 
-    SYNTHESIS_PROMPT = dataset_description + SYNTHESIS_PROMPT
-    EFFICIENT_REGENERATE_PROMPT = dataset_description + EFFICIENT_REGENERATE_PROMPT
-    EFFICIENT_SYNTHESIS_PROMPT = dataset_description + EFFICIENT_SYNTHESIS_PROMPT
-    GAP_DECOMPOSE_PROMPT = dataset_description + GAP_DECOMPOSE_PROMPT
-    REGENERATE_PROMPT = dataset_description + REGENERATE_PROMPT
-    SUBQUESTION_PROMPT = dataset_description + SUBQUESTION_PROMPT
-    PRELIMINARY_PROMPT = dataset_description + PRELIMINARY_PROMPT
+    def _suffix(s: str) -> str:
+        return s + "\n\n" if s else ""
+
+    pp = _suffix(preliminary_prefix)
+    sp = _suffix(subquery_prefix)
+    dd = _suffix(dataset_description)
+
+    PRELIMINARY_PROMPT = dd + pp + PRELIMINARY_PROMPT
+    EFFICIENT_PRELIMINARY_PROMPT = dd + pp + EFFICIENT_PRELIMINARY_PROMPT
+    EFFICIENT_REGENERATE_PROMPT = dd + sp + EFFICIENT_REGENERATE_PROMPT
+    SUBQUESTION_PROMPT = dd + sp + SUBQUESTION_PROMPT
+    SYNTHESIS_PROMPT = dd + SYNTHESIS_PROMPT
+    EFFICIENT_SYNTHESIS_PROMPT = dd + EFFICIENT_SYNTHESIS_PROMPT
+    GAP_DECOMPOSE_PROMPT = dd + GAP_DECOMPOSE_PROMPT
+    REGENERATE_PROMPT = dd + REGENERATE_PROMPT
 
 # =============================================================================
 # CONFIGURATION & DATA CLASSES
@@ -309,19 +308,12 @@ class RoundResult:
 class LLMClient:
     def __init__(self, azure_az_login: bool = False):
         llm_cfg = CONFIG["llm"]
-        # Embedding config: 'embedding' section overrides 'llm' section for backward compatibility
         embed_cfg = {**llm_cfg, **CONFIG.get("embedding", {})}
         self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"])
         self._use_embed_rbac_auth = bool(embed_cfg.get("use_rbac_auth", False))
-        token_scope = llm_cfg.get("token_scope")
-        if not token_scope or not str(token_scope).strip():
-            token_scope = "https://cognitiveservices.azure.com/.default"
-        self._token_scope = str(token_scope).strip()
-        _shared_key = llm_cfg.get("azure_openai_key", "")
-        self._llm_api_key = str(llm_cfg.get("llm_api_key") or _shared_key or "").strip()
-        self._embed_api_key = str(embed_cfg.get("embed_api_key") or _shared_key or "").strip()
-        # Keep for backward compatibility
-        self._api_key = _shared_key
+        self._token_scope = llm_cfg.get("token_scope") or "https://cognitiveservices.azure.com/.default"
+        self._llm_api_key = llm_cfg.get("llm_api_key") or llm_cfg.get("azure_openai_key", "")
+        self._embed_api_key = embed_cfg.get("embed_api_key") or llm_cfg.get("azure_openai_key", "")
         self._token_provider = None
         if self._use_rbac_auth or self._use_embed_rbac_auth:
             self._token_provider = get_bearer_token_provider(AzureCliCredential(), self._token_scope)
@@ -331,12 +323,11 @@ class LLMClient:
         self._local_http_client = None
         self._cfg = llm_cfg
         self._embed_cfg = embed_cfg
-        # Local fallback config: 'local_llm' section overrides 'llm' section for backward compatibility
         local_cfg = {**llm_cfg, **CONFIG.get("local_llm", {})}
         self._embed_dimensions = int(embed_cfg.get("embed_dimensions") or 0)
         self._use_local_fallback_for_subtasks = bool(local_cfg.get("use_local_fallback_for_subtasks", False))
-        self._local_fallback_endpoint = str(local_cfg.get("local_fallback_endpoint", "http://localhost:11434/api/generate") or "").strip()
-        self._local_fallback_model = str(local_cfg.get("local_fallback_model", "") or "").strip()
+        self._local_fallback_endpoint = local_cfg.get("local_fallback_endpoint", "http://localhost:11434/api/generate")
+        self._local_fallback_model = local_cfg.get("local_fallback_model", "")
         self._premium_semaphore = asyncio.Semaphore(max(1, int(llm_cfg.get("premium_max_concurrency", 4))))
         self._local_semaphore = asyncio.Semaphore(max(1, int(local_cfg.get("local_max_concurrency", 8))))
         self._response_cache = LRUCache(int(llm_cfg.get("prompt_cache_size", 2048)))
@@ -358,15 +349,14 @@ class LLMClient:
 
     @staticmethod
     def _is_key_auth_disabled_error(error: Exception) -> bool:
-        status_code = getattr(error, "status_code", None)
-        if status_code != 403:
+        if getattr(error, "status_code", None) != 403:
             return False
         txt = str(error).lower()
-        return (
-            "authenticationtypedisabled" in txt
-            or "key based authentication is disabled" in txt
-            or "authentication type is disabled" in txt
-        )
+        return any(msg in txt for msg in (
+            "authenticationtypedisabled",
+            "key based authentication is disabled",
+            "authentication type is disabled",
+        ))
 
     def _switch_to_rbac_auth(self) -> None:
         self._use_rbac_auth = True
@@ -376,58 +366,41 @@ class LLMClient:
         self._embed_client = None
 
     def _normalize_embedding(self, embedding: list[float]) -> list[float]:
-        if self._embed_dimensions <= 0:
-            return [float(x) for x in embedding]
         values = [float(x) for x in embedding]
-        if len(values) > self._embed_dimensions:
-            return values[:self._embed_dimensions]
-        if len(values) < self._embed_dimensions:
-            return values + [0.0] * (self._embed_dimensions - len(values))
-        return values
+        if self._embed_dimensions <= 0:
+            return values
+        return (values[:self._embed_dimensions] + [0.0] * self._embed_dimensions)[:self._embed_dimensions]
     
+    def _build_openai_client(self, cfg: dict, api_key: str, use_rbac: bool, endpoint_key: str) -> AsyncAzureOpenAI:
+        """Build an AsyncAzureOpenAI client with either RBAC or key auth."""
+        client_kwargs = {"api_version": cfg["api_version"], "azure_endpoint": cfg[endpoint_key]}
+        if use_rbac:
+            client_kwargs["azure_ad_token_provider"] = self._token_provider
+        else:
+            client_kwargs["api_key"] = api_key
+        return AsyncAzureOpenAI(**client_kwargs)
+
     @property
     def llm_client(self) -> AsyncAzureOpenAI:
         if not self._llm_client:
-            client_kwargs = {
-                "api_version": self._cfg["api_version"],
-                "azure_endpoint": self._cfg["llm_endpoint"],
-            }
-            if self._use_rbac_auth:
-                client_kwargs["azure_ad_token_provider"] = self._token_provider
-            else:
-                if not self._llm_api_key:
-                    raise ValueError("llm.llm_api_key (or llm.azure_openai_key) must be set when llm.use_rbac_auth is false")
-                client_kwargs["api_key"] = self._llm_api_key
-            self._llm_client = AsyncAzureOpenAI(**client_kwargs)
+            self._llm_client = self._build_openai_client(self._cfg, self._llm_api_key, self._use_rbac_auth, "llm_endpoint")
         return self._llm_client
     
     @property
     def embed_client(self) -> AsyncAzureOpenAI:
         if not self._embed_client:
-            client_kwargs = {
-                "api_version": self._embed_cfg["api_version"],
-                "azure_endpoint": self._embed_cfg["embed_endpoint"],
-            }
-            if self._use_embed_rbac_auth:
-                client_kwargs["azure_ad_token_provider"] = self._token_provider
-            else:
-                if not self._embed_api_key:
-                    raise ValueError("embedding.embed_api_key (or llm.azure_openai_key) must be set when use_rbac_auth is false")
-                client_kwargs["api_key"] = self._embed_api_key
-            self._embed_client = AsyncAzureOpenAI(**client_kwargs)
+            self._embed_client = self._build_openai_client(self._embed_cfg, self._embed_api_key, self._use_embed_rbac_auth, "embed_endpoint")
         return self._embed_client
     
     def _should_use_local_fallback(self, label: str) -> bool:
-        if not self._use_local_fallback_for_subtasks:
-            return False
-        if self._local_fallback_disabled_until > time.time():
-            return False
-        return label.startswith("LLM gap-decompose") or label.startswith("LLM sub-Q answer")
+        return (
+            self._use_local_fallback_for_subtasks
+            and self._local_fallback_disabled_until <= time.time()
+            and label.startswith(("LLM gap-decompose", "LLM sub-Q answer"))
+        )
 
     def _is_premium_configured(self) -> bool:
-        endpoint = str(self._cfg.get("llm_endpoint", "") or "").strip()
-        model = str(self._cfg.get("llm_model", "") or "").strip()
-        return bool(endpoint and model)
+        return bool(self._cfg.get("llm_endpoint") and self._cfg.get("llm_model"))
 
     def _truncate_prompt(self, prompt: str, max_chars: int) -> str:
         if len(prompt) <= max_chars:
@@ -600,22 +573,21 @@ class LLMClient:
     def _content_to_text(content: Any) -> str:
         if isinstance(content, str):
             return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                    continue
-                if isinstance(item, dict):
-                    text = item.get("text")
-                    if isinstance(text, str):
-                        parts.append(text)
-                    continue
+        if not isinstance(content, list):
+            return ""
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            else:
                 text = getattr(item, "text", None)
                 if isinstance(text, str):
                     parts.append(text)
-            return "".join(parts)
-        return ""
+        return "".join(parts)
 
     def _validated_completion_text(self, result: Any, label: str) -> str:
         choices = getattr(result, "choices", None) or []
@@ -636,10 +608,7 @@ class LLMClient:
         issues: list[str] = []
         if finish_reason in {"tool_calls", "function_call", "content_filter"}:
             issues.append(f"finish_reason={finish_reason}")
-        if isinstance(refusal, str):
-            if refusal.strip():
-                issues.append("message.refusal present")
-        elif refusal:
+        if refusal and (not isinstance(refusal, str) or refusal.strip()):
             issues.append("message.refusal present")
         if tool_calls:
             issues.append("tool_calls present")
@@ -828,14 +797,12 @@ class LLMClient:
                 _log_line(f"Local fallback error ({type(e).__name__}); local fallback unavailable", kind="error")
 
         if premium_error is not None:
-            if isinstance(premium_error, InvalidLLMResponseError):
-                _log_line(f"Invalid LLM response on {label}; using safe fallback response", kind="warn")
-                premium_response = self._safe_fallback_response(label)
-            elif isinstance(premium_error, openai.BadRequestError):
-                _log_line(f"BadRequestError on {label}; using safe fallback response", kind="warn")
-                premium_response = self._safe_fallback_response(label)
-            elif label.startswith("LLM gap-decompose") or label.startswith("LLM sub-Q answer"):
-                _log_line(f"{label} failed after retries; using safe fallback response", kind="warn")
+            is_recoverable = (
+                isinstance(premium_error, (InvalidLLMResponseError, openai.BadRequestError))
+                or label.startswith(("LLM gap-decompose", "LLM sub-Q answer"))
+            )
+            if is_recoverable:
+                _log_line(f"{label} failed ({type(premium_error).__name__}); using safe fallback response", kind="warn")
                 premium_response = self._safe_fallback_response(label)
             else:
                 raise premium_error
@@ -889,18 +856,16 @@ class LLMClient:
         return list(normalized)
 
     async def close(self):
-        if self._llm_client is not None:
-            await self._llm_client.close()
-            self._llm_client = None
-        if self._embed_client is not None:
-            await self._embed_client.close()
-            self._embed_client = None
-        if self._embed_http_client is not None:
-            await self._embed_http_client.aclose()
-            self._embed_http_client = None
-        if self._local_http_client is not None:
-            await self._local_http_client.aclose()
-            self._local_http_client = None
+        for client_attr in ("_llm_client", "_embed_client"):
+            client = getattr(self, client_attr, None)
+            if client is not None:
+                await client.close()
+                setattr(self, client_attr, None)
+        for http_attr in ("_embed_http_client", "_local_http_client"):
+            client = getattr(self, http_attr, None)
+            if client is not None:
+                await client.aclose()
+                setattr(self, http_attr, None)
 
 # =============================================================================
 # COSMOS DB RETRIEVER (moved to utils/cosmos_retriever.py)
@@ -957,7 +922,7 @@ class DecomposedRAGPipeline:
                         if len(filtered) >= max_fanout:
                             break
                     return filtered
-        except:
+        except (json.JSONDecodeError, ValueError, TypeError):
             pass
         return []
 
