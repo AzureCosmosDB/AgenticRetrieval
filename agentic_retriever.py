@@ -377,6 +377,8 @@ class LLMClient:
         if use_rbac:
             client_kwargs["azure_ad_token_provider"] = self._token_provider
         else:
+            if not api_key.strip():
+                raise ValueError("API key is required for key authentication")
             client_kwargs["api_key"] = api_key
         return AsyncAzureOpenAI(**client_kwargs)
 

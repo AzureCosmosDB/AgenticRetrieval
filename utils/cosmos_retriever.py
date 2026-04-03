@@ -65,7 +65,7 @@ def _get_source_config(config: dict[str, Any]) -> list[dict[str, Any]]:
     normalized_sources: list[dict[str, Any]] = []
     for idx, source in enumerate(configured_sources, start=1):
         source = source or {}
-        retrieval_cfg = source.get("retrieval") or {}
+        retrieval_cfg = source.get("retrieval")
         normalized_sources.append({
             "id": source["id"],
             "container_name": source["container_name"],
@@ -111,13 +111,13 @@ class CombinedRetriever:
         self._ranker_http_client: httpx.AsyncClient | None = None
         ranker_cfg = CONFIG["ranker"]
         self._use_ranker = bool(ranker_cfg["use_ranker"])
-        self._ranker_region = ranker_cfg["region"]
-        self._ranker_account = ranker_cfg["account_name"]
+        self._ranker_region = str(ranker_cfg["region"]).strip()
+        self._ranker_account = str(ranker_cfg["account_name"]).strip()
         self._ranker_batch_size = int(ranker_cfg["batch_size"])
         self._ranker_access_token: str | None = None
         if self._use_ranker:
             if ranker_cfg["read_token_from_path"]:
-                token_path = ranker_cfg["access_token_path"]
+                token_path = str(ranker_cfg["access_token_path"]).strip()
                 if token_path and os.path.isfile(token_path):
                     with open(token_path, "r") as f:
                         self._ranker_access_token = f.read().strip()
@@ -514,7 +514,7 @@ class CombinedRetriever:
                 "Authorization": f"Bearer {self._ranker_access_token}",
                 "Content-Type": "application/json",
             }
-            url_suffix = CONFIG["ranker"]["url_suffix"]
+            url_suffix = str(CONFIG["ranker"]["url_suffix"]).strip()
             url = f"https://{self._ranker_account}.{self._ranker_region}.{url_suffix}"
             max_retries = int(CONFIG["ranker"]["max_retries"])
             ranker_succeeded = False
