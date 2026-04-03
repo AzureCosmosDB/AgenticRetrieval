@@ -353,6 +353,8 @@ class LLMClient:
         self._introspection_done = False
         self._introspection_lock = asyncio.Lock()
         self.total_prompt_chars = 0
+        self.total_prompt_tokens = 0
+        self.total_llm_calls = 0
 
     @staticmethod
     def _is_key_auth_disabled_error(error: Exception) -> bool:
@@ -693,7 +695,9 @@ class LLMClient:
 
         usage = getattr(result, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+        self.total_llm_calls += 1
         if isinstance(prompt_tokens, int) and prompt_tokens > 0:
+            self.total_prompt_tokens += prompt_tokens
             observed = len(prompt) / float(prompt_tokens)
             observed = min(8.0, max(2.0, observed))
             self._chars_per_token_estimate = (self._chars_per_token_estimate * 0.8) + (observed * 0.2)
@@ -1327,6 +1331,9 @@ async def main_async():
             _log_line(f"  - {file_path}", kind="success")
 
     _log_line(f"Total symbols passed to LLM: {llm.total_prompt_chars:,}", kind="info")
+    if llm.total_llm_calls > 0:
+        avg_tokens = llm.total_prompt_tokens / llm.total_llm_calls
+        _log_line(f"Total prompt tokens: {llm.total_prompt_tokens:,} across {llm.total_llm_calls} LLM calls (avg {avg_tokens:,.0f} tokens/call)", kind="info")
 
     await retriever.close()
     await llm.close()

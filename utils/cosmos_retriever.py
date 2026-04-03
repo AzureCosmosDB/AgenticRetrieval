@@ -241,8 +241,9 @@ class CombinedRetriever:
                 except Exception as e:
                     _log_line(f"Ranker account registration failed: {e}", kind="warn")
 
-    async def _fulltext_search(self, container, fields: list[str], query: str, top_k: int) -> list[dict]:
-        if top_k <= 0 or not fields:
+    async def _fulltext_search_single_field(self, container, field: str, query: str, top_k: int) -> list[dict]:
+        """Run a fulltext search on a single field, returning ranked results."""
+        if top_k <= 0:
             return []
         terms = [t for t in re.findall(r"\w+", query) if t.lower() not in STOPWORDS and len(t) > 1]
         if not terms:
