@@ -311,9 +311,9 @@ class LLMClient:
         embed_cfg = {**llm_cfg, **CONFIG.get("embedding", {})}
         self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"])
         self._use_embed_rbac_auth = bool(embed_cfg.get("use_rbac_auth", False))
-        self._token_scope = llm_cfg.get("token_scope") or "https://cognitiveservices.azure.com/.default"
-        self._llm_api_key = llm_cfg.get("llm_api_key") or llm_cfg.get("azure_openai_key", "")
-        self._embed_api_key = embed_cfg.get("embed_api_key") or llm_cfg.get("azure_openai_key", "")
+        self._token_scope = llm_cfg["token_scope"]
+        self._llm_api_key = llm_cfg["llm_api_key"]
+        self._embed_api_key = embed_cfg["embed_api_key"]
         self._token_provider = None
         if self._use_rbac_auth or self._use_embed_rbac_auth:
             self._token_provider = get_bearer_token_provider(AzureCliCredential(), self._token_scope)
