@@ -5,6 +5,7 @@ aiohttp
 httpx
 numpy
 openai
+openai-agents
 python-dotenv
 PyYAML
 requests

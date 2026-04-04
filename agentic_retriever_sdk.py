@@ -15,12 +15,10 @@ import asyncio
 import datetime
 import json
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import yaml
 from openai import AsyncAzureOpenAI
 from azure.identity import AzureCliCredential, get_bearer_token_provider
 from tqdm import tqdm
@@ -494,10 +492,13 @@ async def main():
             azure_ad_token_provider=token_provider,
         )
     else:
+        api_key = llm_cfg["llm_api_key"]
+        if not api_key:
+            raise ValueError("LLM API key must be provided in config if not using RBAC auth")
         azure_client = AsyncAzureOpenAI(
             api_version=llm_cfg["api_version"],
             azure_endpoint=llm_cfg["llm_endpoint"],
-            api_key=llm_cfg["llm_api_key"],
+            api_key=api_key,
         )
 
     provider = OpenAIProvider(openai_client=azure_client, use_responses=False)
@@ -533,6 +534,8 @@ async def main():
 
     results = []
     max_workers = args.max_workers or CONFIG["execution"].get("max_workers")
+    if not max_workers:
+        raise ValueError("Must specify --max-workers or set max_workers in config under execution")
     semaphore = asyncio.Semaphore(int(max_workers))
     _log_line(f"Parallel workers: {max_workers}", kind="info")
 
@@ -602,6 +605,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    sys.modules.setdefault("agentic_retriever", sys.modules[__name__] if "agentic_retriever" not in sys.modules else sys.modules["agentic_retriever"])
-    # Ensure agentic_retriever module is loaded for cosmos_retriever imports
     asyncio.run(main())
