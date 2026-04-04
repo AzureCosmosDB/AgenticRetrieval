@@ -695,7 +695,6 @@ class LLMClient:
 
         usage = getattr(result, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
-        self.total_llm_calls += 1
         if isinstance(prompt_tokens, int) and prompt_tokens > 0:
             self.total_llm_calls += 1
             self.total_prompt_tokens += prompt_tokens
