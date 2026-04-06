@@ -1206,7 +1206,7 @@ async def main_async():
     parser.add_argument("--timing", action="store_true", help="Print timing checkpoints for each major operation")
     parser.add_argument("--cosmos-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Cosmos DB")
     parser.add_argument("--azure-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Azure OpenAI LLM")
-    parser.add_argument("--separate-subq-calls", action="store_true", help="Use separate LLM calls per sub-question instead of the default efficient pipeline")
+    parser.add_argument("--separate-subq-calls", action="store_true", help="Use separate LLM calls per sub-question instead of the default efficient pipeline (`--efficient` has been removed)")
     args = parser.parse_args()
 
     global _TIMING, _t0
