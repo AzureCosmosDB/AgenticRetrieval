@@ -1175,7 +1175,7 @@ async def main_async():
     parser.add_argument("--timing", action="store_true", help="Print timing checkpoints for each major operation")
     parser.add_argument("--cosmos-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Cosmos DB")
     parser.add_argument("--azure-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Azure OpenAI LLM")
-    parser.add_argument("--efficient", action="store_true", help="Use efficient pipeline: each round retrieves k/#subquestions per sub-question, combines results, and regenerates the answer")
+    parser.add_argument("--separate-subq-calls", action="store_true", help="Use separate LLM calls per sub-question instead of the default efficient pipeline (`--efficient` has been removed)")
     args = parser.parse_args()
 
     global _TIMING, _t0
@@ -1233,10 +1233,10 @@ async def main_async():
     async def process(q: Question):
         token = _CURRENT_QUESTION_ID.set(q.question_id)
         try:
-            if args.efficient:
-                result = await pipeline.run_efficient(q.question_text)
-            else:
+            if args.separate_subq_calls:
                 result = await pipeline.run(q.question_text)
+            else:
+                result = await pipeline.run_efficient(q.question_text)
         finally:
             _CURRENT_QUESTION_ID.reset(token)
         result["question_id"] = q.question_id
