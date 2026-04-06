@@ -314,8 +314,6 @@ class LLMClient:
         self._use_rbac_auth = bool(llm_cfg["use_rbac_auth"])
         self._use_embed_rbac_auth = bool(embed_cfg.get("use_rbac_auth", False))
         token_scope = llm_cfg.get("token_scope")
-        if not token_scope or not str(token_scope).strip():
-            token_scope = "https://cognitiveservices.azure.com/.default"
         self._token_scope = str(token_scope).strip()
         _shared_key = llm_cfg.get("azure_openai_key", "")
         self._llm_api_key = str(llm_cfg.get("llm_api_key") or _shared_key or "").strip()
@@ -695,7 +693,6 @@ class LLMClient:
 
         usage = getattr(result, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
-        self.total_llm_calls += 1
         if isinstance(prompt_tokens, int) and prompt_tokens > 0:
             self.total_llm_calls += 1
             self.total_prompt_tokens += prompt_tokens
@@ -1209,7 +1206,7 @@ async def main_async():
     parser.add_argument("--timing", action="store_true", help="Print timing checkpoints for each major operation")
     parser.add_argument("--cosmos-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Cosmos DB")
     parser.add_argument("--azure-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Azure OpenAI LLM")
-    parser.add_argument("--efficient", action="store_true", help="Use efficient pipeline: each round retrieves k/#subquestions per sub-question, combines results, and regenerates the answer")
+    parser.add_argument("--separate-subq-calls", action="store_true", help="Use separate LLM calls per sub-question instead of the default efficient pipeline")
     args = parser.parse_args()
 
     global _TIMING, _t0
@@ -1267,10 +1264,10 @@ async def main_async():
     async def process(q: Question):
         token = _CURRENT_QUESTION_ID.set(q.question_id)
         try:
-            if args.efficient:
-                result = await pipeline.run_efficient(q.question_text)
-            else:
+            if args.separate_subq_calls:
                 result = await pipeline.run(q.question_text)
+            else:
+                result = await pipeline.run_efficient(q.question_text)
         finally:
             _CURRENT_QUESTION_ID.reset(token)
         result["question_id"] = q.question_id
