@@ -470,7 +470,7 @@ async def main():
     parser.add_argument("--max-sub-questions", type=int, default=3)
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument("--cosmos-az-login", action="store_true")
-    parser.add_argument("--efficient", action="store_true", help="Use efficient pipeline: retrieves k/#subquestions per sub-question, combines, and regenerates")
+    parser.add_argument("--separate-subq-calls", action="store_true", help="Use separate LLM calls per sub-question instead of the default efficient pipeline")
     parser.add_argument("--questions-path", type=Path, default=None)
     parser.add_argument("--output-root", type=Path, default=None)
     args = parser.parse_args()
@@ -525,7 +525,7 @@ async def main():
     if args.max_questions:
         questions = questions[:args.max_questions]
 
-    _log_line(f"Processing {len(questions)} questions with Agents SDK{' (efficient)' if args.efficient else ''}", kind="info")
+    _log_line(f"Processing {len(questions)} questions with Agents SDK{' (separate sub-Q calls)' if args.separate_subq_calls else ''}", kind="info")
 
     # Process questions
     output_root = args.output_root or Path(CONFIG["paths"]["output_root"])
@@ -542,7 +542,7 @@ async def main():
     async def process_question(q: dict) -> dict | None:
         async with semaphore:
             try:
-                pipeline_fn = run_rag_pipeline_efficient if args.efficient else run_rag_pipeline
+                pipeline_fn = run_rag_pipeline if args.separate_subq_calls else run_rag_pipeline_efficient
                 result = await pipeline_fn(
                     agents, provider, retriever,
                     question=q["question_text"],
