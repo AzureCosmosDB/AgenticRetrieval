@@ -425,6 +425,7 @@ class CombinedRetriever:
             if source.get("chunking_enabled") and source.get("chunk_field"):
                 chunking_map[source["id"]] = {
                     "chunk_field": source["chunk_field"],
+                    "embedding_field": source.get("embedding_field", "e"),
                 }
 
         if not chunking_map:
@@ -444,7 +445,8 @@ class CombinedRetriever:
                 expanded.append(chunk)
                 continue
             chunk_field = cfg["chunk_field"]
-            exclude_with_chunk_field = exclude | {chunk_field}
+            emb_field = cfg.get("embedding_field", "e")
+            exclude_with_chunk_field = exclude | {chunk_field, emb_field}
             chunk_field_value = str(raw_doc.get(chunk_field, '')).strip()
             chunk_field_prefix = f"{chunk_field.replace('_', ' ').title()}: {chunk_field_value}\n" if chunk_field_value else ""
             has_fields = False
