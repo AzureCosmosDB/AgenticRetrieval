@@ -450,7 +450,7 @@ class CombinedRetriever:
             chunk_field_value = str(raw_doc.get(chunk_field, '')).strip()
             chunk_field_prefix = f"{chunk_field.replace('_', ' ').title()}: {chunk_field_value}\n" if chunk_field_value else ""
             has_fields = False
-            clean_metadata = {mk: mv for mk, mv in chunk.metadata.items() if mk != '_raw_doc'}
+            clean_metadata = {mk: mv for mk, mv in chunk.metadata.items() if mk not in ('_raw_doc', 'embedding')}
             for k, v in raw_doc.items():
                 if k in exclude_with_chunk_field or not v:
                     continue
@@ -595,8 +595,16 @@ class CombinedRetriever:
             chunks = [chunks[i] for i in selected]
             _ck(f"  retrieve: greedy log-det – done (selected {len(chunks)} of {effective_k_diverse} requested)", t)
 
+        # Strip embeddings from metadata (no longer needed after diversity selection)
+        for c in chunks:
+            c.metadata.pop('embedding', None)
+
         # Expand chunks into per-field chunks for ranker
         chunks = self._expand_chunks(chunks)
+
+        # Strip raw docs from metadata (no longer needed after expansion)
+        for c in chunks:
+            c.metadata.pop('_raw_doc', None)
 
         # Semantic ranker reranking
         effective_k_ranker = self.k_ranker // k_divisor
