@@ -75,6 +75,7 @@ def _get_source_config(config: dict[str, Any]) -> list[dict[str, Any]]:
         source = source or {}
         retrieval_cfg = source.get("retrieval") or {}
         source_id = str(source.get("id") or f"source_{idx}").strip()
+        chunking_cfg = source.get("chunking") or {}
         normalized_sources.append(
             {
                 "id": source_id,
@@ -84,6 +85,8 @@ def _get_source_config(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "vector_k": int(retrieval_cfg.get("vector_k", 0) or 0),
                 "fulltext_k": int(retrieval_cfg.get("fulltext_k", 0) or 0),
                 "fulltext_fields": _as_list_of_strings(retrieval_cfg.get("fulltext_fields")),
+                "chunking_enabled": bool(chunking_cfg.get("enabled", False)),
+                "chunk_field": str(chunking_cfg.get("chunk_field", "")).strip(),
             }
         )
     return normalized_sources
@@ -190,6 +193,8 @@ class CombinedRetriever:
                     "vector_k": max(0, vector_k),
                     "fulltext_k": max(0, fulltext_k),
                     "fulltext_fields": fulltext_fields,
+                    "chunking_enabled": bool(source.get("chunking_enabled", False)),
+                    "chunk_field": str(source.get("chunk_field", "")).strip(),
                 }
             )
         return normalized
@@ -397,7 +402,7 @@ class CombinedRetriever:
         _ck(f"vector materialize x{len(docs)} ({container.id}) – done", t_reads)
         return docs
     
-    def _format_doc(self, doc: dict, source: str, embedding_field: str = "e") -> RetrievedChunk:
+    def _format_doc(self, doc: dict, source: str, embedding_field: str = "e", source_id: str = "") -> RetrievedChunk:
         emb_field = str(embedding_field or "e").strip()
         embedding = doc.get(emb_field) if isinstance(doc.get(emb_field), list) else doc.get('embedding')
         exclude = {'_rid', '_self', '_etag', '_attachments', '_ts', 'embedding', '_score', emb_field}
@@ -409,9 +414,70 @@ class CombinedRetriever:
             chunk_id=doc.get('id', ''),
             text="\n".join(parts),
             similarity=(1 - doc.get('_score', 0)) if '_score' in doc else None,
-            metadata={'_data_source': source, 'embedding': embedding}
+            metadata={'_data_source': source, '_source_id': source_id, 'embedding': embedding, '_raw_doc': doc}
         )
     
+    def _expand_chunks(self, chunks: list[RetrievedChunk]) -> list[RetrievedChunk]:
+        """Expand chunks into per-field chunks (chunk_field + field) for ranker."""
+        # Build a lookup of source_id -> chunking config
+        chunking_map: dict[str, dict[str, Any]] = {}
+        for source in self._sources:
+            if source.get("chunking_enabled") and source.get("chunk_field"):
+                chunking_map[source["id"]] = {
+                    "chunk_field": source["chunk_field"],
+                }
+
+        if not chunking_map:
+            return chunks
+
+        exclude = {'_rid', '_self', '_etag', '_attachments', '_ts', 'embedding', '_score',
+                   'id', 'pk', '_raw_doc'}
+        expanded: list[RetrievedChunk] = []
+        for chunk in chunks:
+            source_id = chunk.metadata.get('_source_id', '')
+            cfg = chunking_map.get(source_id)
+            if not cfg:
+                expanded.append(chunk)
+                continue
+            raw_doc = chunk.metadata.get('_raw_doc')
+            if not raw_doc:
+                expanded.append(chunk)
+                continue
+            chunk_field = cfg["chunk_field"]
+            exclude_with_chunk_field = exclude | {chunk_field}
+            chunk_field_value = str(raw_doc.get(chunk_field, '')).strip()
+            chunk_field_prefix = f"{chunk_field.replace('_', ' ').title()}: {chunk_field_value}\n" if chunk_field_value else ""
+            has_fields = False
+            clean_metadata = {mk: mv for mk, mv in chunk.metadata.items() if mk != '_raw_doc'}
+            for k, v in raw_doc.items():
+                if k in exclude_with_chunk_field or not v:
+                    continue
+                if isinstance(v, dict):
+                    v = str(v)
+                if isinstance(v, list):
+                    for i, item in enumerate(v):
+                        item_str = str(item).strip()
+                        if not item_str:
+                            continue
+                        has_fields = True
+                        expanded.append(RetrievedChunk(
+                            chunk_id=f"{chunk.chunk_id}_{k}_{i}",
+                            text=f"{chunk_field_prefix}{k.replace('_', ' ').title()}: {item_str}",
+                            similarity=chunk.similarity,
+                            metadata=clean_metadata,
+                        ))
+                else:
+                    has_fields = True
+                    expanded.append(RetrievedChunk(
+                        chunk_id=f"{chunk.chunk_id}_{k}",
+                        text=f"{chunk_field_prefix}{k.replace('_', ' ').title()}: {v}",
+                        similarity=chunk.similarity,
+                        metadata=clean_metadata,
+                    ))
+            if not has_fields:
+                expanded.append(chunk)
+        return expanded
+
     async def retrieve(self, query: str, k_divisor: int = 1) -> list[RetrievedChunk]:
         """Retrieve chunks for *query*.
 
@@ -486,7 +552,7 @@ class CombinedRetriever:
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
-                chunks.append(self._format_doc(doc, f"{source['id']}_fulltext", str(source.get("embedding_field") or "e")))
+                chunks.append(self._format_doc(doc, f"{source['id']}_fulltext", str(source.get("embedding_field") or "e"), source_id=source["id"]))
 
         for info, task in vector_tasks:
             source = info["source"]
@@ -497,10 +563,11 @@ class CombinedRetriever:
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
-                chunks.append(self._format_doc(doc, f"{source['id']}_vector", str(source.get("embedding_field") or "e")))
+                chunks.append(self._format_doc(doc, f"{source['id']}_vector", str(source.get("embedding_field") or "e"), source_id=source["id"]))
         
         # Diversity selection via greedy log-det maximization
-        if self.k_diverse > 0 and len(chunks) > self.k_diverse:
+        effective_k_diverse = self.k_diverse // k_divisor
+        if effective_k_diverse > 0 and len(chunks) > effective_k_diverse:
             t = _ck("  retrieve: diversity embed missing – start")
             missing_chunks = [c for c in chunks if c.metadata.get('embedding') is None]
             n_missing = len(missing_chunks)
@@ -515,16 +582,19 @@ class CombinedRetriever:
             if emb is None:
                 emb = await self._llm.embed(query)
             query_vec = np.array(emb, dtype=np.float32)
-            selected = greedy_log_det_select(vectors, query_vec, self.k_diverse, self.eta, self.rescale_power)
-            if len(selected) < self.k_diverse:
+            selected = greedy_log_det_select(vectors, query_vec, effective_k_diverse, self.eta, self.rescale_power)
+            if len(selected) < effective_k_diverse:
                 warnings.warn(
-                    f"greedy_log_det_select returned {len(selected)}/{self.k_diverse}: "
+                    f"greedy_log_det_select returned {len(selected)}/{effective_k_diverse}: "
                     "vectors are nearly linearly dependent",
                     RuntimeWarning,
                     stacklevel=2,
                 )
             chunks = [chunks[i] for i in selected]
-            _ck(f"  retrieve: greedy log-det – done (selected {len(chunks)} of {self.k_diverse} requested)", t)
+            _ck(f"  retrieve: greedy log-det – done (selected {len(chunks)} of {effective_k_diverse} requested)", t)
+
+        # Expand chunks into per-field chunks for ranker
+        chunks = self._expand_chunks(chunks)
 
         # Semantic ranker reranking
         effective_k_ranker = self.k_ranker // k_divisor

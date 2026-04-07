@@ -115,6 +115,9 @@ cosmos:
       partition_key_path: "/pk"
       embedding_field: "e"
       documents_root: ""
+      chunking:
+        enabled: false
+        chunk_field: ""
       embedding_text_fields:
         - title
         - summary
@@ -160,6 +163,9 @@ cosmos:
       partition_key_path: "/pk"
       embedding_field: "e"
       documents_root: ""
+      chunking:
+        enabled: false
+        chunk_field: ""
       embedding_text_fields:
         - text
       retrieval:
