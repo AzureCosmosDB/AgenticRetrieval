@@ -24,7 +24,11 @@ async def vec_search(container, emb, top_k, ef):
     sql = f"SELECT TOP @k c, VectorDistance(c.{ef}, @emb) AS score FROM c ORDER BY VectorDistance(c.{ef}, @emb)"
     return [item.get("c", item) async for item in container.query_items(query=sql, parameters=[{"name":"@k","value":top_k},{"name":"@emb","value":emb}])]
 
+_SAFE_FIELD_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$')
+
 async def ft_field(container, field, query, top_k):
+    if not _SAFE_FIELD_RE.match(field):
+        raise ValueError(f"Invalid fulltext field name: {field!r}")
     terms = [t for t in re.findall(r"\w+", query) if t.lower() not in STOPWORDS and len(t) > 1]
     if not terms or top_k <= 0: return []
     chunks = [terms[i:i+5] for i in range(0, len(terms), 5)]
@@ -78,11 +82,15 @@ async def do_search(query, containers):
     return json.dumps([{"docid": re.search(r'^id: (.+)$', d, re.MULTILINE).group(1) if re.search(r'^id: (.+)$', d, re.MULTILINE) else "", "snippet": d[:2000]} for d in ranked])
 
 async def do_get_doc(docid, containers):
-    for c in containers.values():
+    for container_id, c in containers.items():
         try:
             async for item in c.query_items(query="SELECT * FROM c WHERE c.id=@id", parameters=[{"name":"@id","value":docid}]):
                 return json.dumps({"docid": docid, "text": fmt(item)})
-        except: continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  [get_document] Cosmos query failed for container={container_id}, docid={docid}: {e}")
+            continue
     return json.dumps({"error": f"Not found: {docid}"})
 
 async def do_prune(docids, containers, doc_cache):
@@ -91,12 +99,16 @@ async def do_prune(docids, containers, doc_cache):
         if did in doc_cache:
             parts.append(f'<doc id="{did}">\n{doc_cache[did]}\n</doc>')
             continue
-        for c in containers.values():
+        for container_id, c in containers.items():
             try:
                 async for item in c.query_items(query="SELECT * FROM c WHERE c.id=@id", parameters=[{"name":"@id","value":did}]):
                     text = fmt(item); doc_cache[did] = text
                     parts.append(f'<doc id="{did}">\n{text}\n</doc>'); break
-            except: continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"  [prune] Cosmos query failed for container={container_id}, docid={did}: {e}")
+                continue
     return "Pruned context (only these documents remain):\n\n" + "\n\n".join(parts)
 
 TOOLS = [
@@ -117,7 +129,7 @@ async def process_question(q_obj, containers):
     retries = 0
     for iteration in range(50):
         try:
-            r = await llm.chat.completions.create(model=llm_cfg["llm_model"], messages=msgs, tools=TOOLS, tool_choice="auto", temperature=0, max_completion_tokens=llm_cfg["max_completion_tokens"])
+            r = await llm.chat.completions.create(model=llm_cfg["llm_model"], messages=msgs, tools=TOOLS, tool_choice="auto", temperature=llm_cfg.get("temperature", 0), max_completion_tokens=llm_cfg["max_completion_tokens"])
             retries = 0
         except (oai.BadRequestError, oai.RateLimitError, oai.APIStatusError) as e:
             retries += 1; print(f"  LLM error: {e}"); await asyncio.sleep(min(5*2**retries, 300)); continue
