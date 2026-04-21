@@ -24,11 +24,12 @@ def all_text(el, path: str) -> list[str]:
     """Return text of every element matching *path*."""
     if el is None:
         return []
-    return [
-        "".join(n.itertext()).strip()
-        for n in el.findall(path)
-        if "".join(n.itertext()).strip()
-    ]
+    texts: list[str] = []
+    for n in el.findall(path):
+        value = "".join(n.itertext()).strip()
+        if value:
+            texts.append(value)
+    return texts
 
 
 def attr(el, path: str, attr_name: str, ns_map: dict | None = None, default: str = "") -> str:

@@ -130,20 +130,27 @@ def _extract_cited_pmcids(xml_path: str) -> tuple[str, list[str]]:
     return (pmcid, cited)
 
 
+def _init_worker_pmid_to_pmcid(mapping: dict[str, str]) -> None:
+    """Initializer for worker processes to set the PMID→PMCID mapping."""
+    global _pmid_to_pmcid
+    _pmid_to_pmcid = mapping
+
+
 def build_citation_maps(
     xml_files: list[str],
     pmid_to_pmcid: dict[str, str],
     workers: int = 16,
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
     """Build cited_by and cites mappings from a list of XML files."""
-    global _pmid_to_pmcid
-    _pmid_to_pmcid = pmid_to_pmcid
-
     cited_by: dict[str, list[str]] = defaultdict(list)
     cites: dict[str, list[str]] = {}
 
     log.info(f"Building citation graph from {len(xml_files)} files ({workers} workers)...")
-    with MPool(processes=workers) as pool:
+    with MPool(
+        processes=workers,
+        initializer=_init_worker_pmid_to_pmcid,
+        initargs=(pmid_to_pmcid,),
+    ) as pool:
         for i, (src_pmcid, ref_pmcids) in enumerate(
             pool.imap_unordered(_extract_cited_pmcids, xml_files, chunksize=256)
         ):
@@ -189,22 +196,41 @@ async def patch_cosmos_documents(
     all_pmcids = set(cited_by_map.keys()) | set(cites_map.keys())
     log.info(f"Patching {len(all_pmcids)} documents with citation data...")
 
-    success = failed = 0
-    for pmcid in all_pmcids:
-        patch_ops = [
-            {"op": "set", "path": "/cited_by", "value": cited_by_map.get(pmcid, [])},
-            {"op": "set", "path": "/cited_by_count", "value": len(cited_by_map.get(pmcid, []))},
-            {"op": "set", "path": "/cites", "value": cites_map.get(pmcid, [])},
-            {"op": "set", "path": "/cites_count", "value": len(cites_map.get(pmcid, []))},
-        ]
-        try:
-            await container.patch_item(item=pmcid, partition_key=pmcid, patch_operations=patch_ops)
-            success += 1
-        except Exception as e:
-            log.debug(f"Patch failed for {pmcid}: {e}")
-            failed += 1
-        if (success + failed) % 10_000 == 0:
-            log.info(f"  patched {success} ok, {failed} failed so far")
+    max_concurrent_patches = 20
+    semaphore = asyncio.Semaphore(max_concurrent_patches)
+    counter_lock = asyncio.Lock()
+    success = 0
+    failed = 0
+
+    async def _patch_one(pmcid: str) -> None:
+        nonlocal success, failed
+        async with semaphore:
+            patch_ops = [
+                {"op": "set", "path": "/cited_by", "value": cited_by_map.get(pmcid, [])},
+                {"op": "set", "path": "/cited_by_count", "value": len(cited_by_map.get(pmcid, []))},
+                {"op": "set", "path": "/cites", "value": cites_map.get(pmcid, [])},
+                {"op": "set", "path": "/cites_count", "value": len(cites_map.get(pmcid, []))},
+            ]
+            try:
+                await container.patch_item(
+                    item=pmcid, partition_key=pmcid, patch_operations=patch_ops,
+                )
+                async with counter_lock:
+                    success += 1
+                    total = success + failed
+                    if total % 10_000 == 0:
+                        log.info(f"  patched {success} ok, {failed} failed so far")
+            except Exception as e:
+                log.debug(f"Patch failed for {pmcid}: {e}")
+                async with counter_lock:
+                    failed += 1
+                    total = success + failed
+                    if total % 10_000 == 0:
+                        log.info(f"  patched {success} ok, {failed} failed so far")
+
+    tasks = [asyncio.create_task(_patch_one(pmcid)) for pmcid in all_pmcids]
+    if tasks:
+        await asyncio.gather(*tasks)
 
     log.info(f"Patching done: {success} succeeded, {failed} failed")
 

@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import logging
 import time
 import re
 import hashlib
@@ -255,17 +256,34 @@ def _load_document_parser(parser_spec: str) -> Callable[[str], Optional[Dict[str
         raise ValueError(
             f"document_parser must be 'module_path:function_name', got: {parser_spec}"
         )
-    module_path, func_name = parser_spec.rsplit(":", 1)
+    module_path_str, func_name = parser_spec.rsplit(":", 1)
 
-    if os.path.isfile(module_path):
-        spec = importlib.util.spec_from_file_location("_custom_parser", module_path)
+    mod = None
+    module_path = Path(module_path_str)
+
+    # 1. Check the path as provided (may be absolute or relative to CWD).
+    if module_path.is_file():
+        spec = importlib.util.spec_from_file_location("_custom_parser", str(module_path))
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load module from {module_path}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-    else:
+
+    # 2. If not found and path is relative, check relative to this script's directory.
+    if mod is None and not module_path.is_absolute():
+        base_dir = Path(__file__).resolve().parent
+        candidate_path = (base_dir / module_path).resolve()
+        if candidate_path.is_file():
+            spec = importlib.util.spec_from_file_location("_custom_parser", str(candidate_path))
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load module from {candidate_path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+    # 3. Fall back to importing as a dotted Python module path.
+    if mod is None:
         import importlib as _imp
-        mod = _imp.import_module(module_path)
+        mod = _imp.import_module(module_path_str)
 
     fn = getattr(mod, func_name, None)
     if fn is None:
@@ -282,8 +300,12 @@ def _normalize_embedding(embedding: List[float]) -> List[float]:
     return values
 
 
+_embed_credential = None  # Stored for cleanup during shutdown
+
+
 def get_embedding_client() -> AsyncAzureOpenAI | None:
     """Initialize a single embedding client from llm.embed_endpoint/embed_model settings."""
+    global _embed_credential
     endpoint = EMBED_ENDPOINT.rstrip("/")
     if endpoint.endswith("/api/embeddings"):
         return None
@@ -297,8 +319,8 @@ def get_embedding_client() -> AsyncAzureOpenAI | None:
         token_scope = CONFIG.get("embedding", {}).get(
             "token_scope", "https://cognitiveservices.azure.com/.default"
         )
-        credential = DefaultAzureCredential()
-        token_provider = get_bearer_token_provider(credential, token_scope)
+        _embed_credential = DefaultAzureCredential()
+        token_provider = get_bearer_token_provider(_embed_credential, token_scope)
         return AsyncAzureOpenAI(
             azure_endpoint=azure_endpoint,
             azure_ad_token_provider=token_provider,
@@ -983,6 +1005,8 @@ async def main_async():
         await cosmos_client.close()
         if data_plane_credential is not None:
             await data_plane_credential.close()
+        if _embed_credential is not None:
+            _embed_credential.close()
         return
 
     batch_size = EMBEDDING_BATCH_SIZE
@@ -1082,11 +1106,25 @@ async def main_async():
                 for file_path in file_iter:
                     files_processed += 1
                     parse_start = time.perf_counter()
-                    doc = document_parser_fn(file_path)
+                    try:
+                        doc = document_parser_fn(file_path)
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(
+                            "Parser failed for %s: %s", file_path, e,
+                        )
+                        total_parse_seconds += (time.perf_counter() - parse_start)
+                        failed_uploads += 1
+                        continue
                     total_parse_seconds += (time.perf_counter() - parse_start)
                     if doc is None or not isinstance(doc, dict):
                         failed_uploads += 1
                         continue
+                    # Add provenance and deterministic ID fallback
+                    relpath = os.path.relpath(file_path, documents_root)
+                    if "_source_file" not in doc or not doc.get("_source_file"):
+                        doc["_source_file"] = relpath
+                    if not doc.get("id"):
+                        replace_document_id(doc, relpath)
                     batch_queue.append(doc)
 
                     if len(batch_queue) >= batch_size:
@@ -1196,6 +1234,8 @@ async def main_async():
     await cosmos_client.close()
     if data_plane_credential is not None:
         await data_plane_credential.close()
+    if _embed_credential is not None:
+        _embed_credential.close()
 
 
 if __name__ == "__main__":

@@ -37,11 +37,6 @@ from utils.xml_helpers import (
 
 log = logging.getLogger(__name__)
 
-# Default embedding text fields for PMC articles
-PMC_EMBEDDING_TEXT_FIELDS = ["journal_title", "title", "toc_abstract", "abstract", "full_text"]
-PMC_EMBEDDING_FIELD = "embedding"
-PREFIX_LENGTH = int(8192 * 1.5)
-
 
 # ---------------------------------------------------------------------------
 # Body / full-text extraction
@@ -229,7 +224,7 @@ def parse_article(xml_path: str) -> Optional[dict]:
     pub_date_epub = _parse_date(ameta.find(".//pub-date[@pub-type='epub']"))
     pub_date_release = _parse_date(ameta.find(".//pub-date[@pub-type='pmc-release']"))
 
-    pub_year = "unknown"
+    pub_year: int | None = None
     for pd in ameta.findall(".//pub-date"):
         yr = _text(pd, "year")
         if yr:
