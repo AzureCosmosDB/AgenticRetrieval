@@ -10,6 +10,21 @@ retrieval:
   rescale_power: 5.0  # Query-similarity rescale power
   cache_size: 20
 
+# Semantic ranker (reranking after diversity selection)
+ranker:
+  use_ranker: true
+  k_ranker: 30
+  region: ""
+  account_name: ""
+  read_token_from_path: true
+  access_token_path: ""
+  tenant_id: "a" # this is needed when read_token_from_path = false
+  token_scope: "b" # this is needed when read_token_from_path = false
+  register_account_path: "c" # this is needed when read_token_from_path = false
+  url_suffix: ""
+  batch_size: 64
+  max_retries: 10
+
 # Pipeline parameters
 pipeline:
   max_sub_questions: 2

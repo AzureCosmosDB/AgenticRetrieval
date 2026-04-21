@@ -1,6 +1,5 @@
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -15,6 +14,9 @@ TIMING_ENTRY_RE = re.compile(
 PROCESSING_RE = re.compile(r"Processing\s+(\d+)\s+questions")
 VEC_DONE_RE = re.compile(r"vector query – done \((\d+) results(?:,\s*([^)]+))?\)")
 MAT_DONE_RE = re.compile(r"vector materialize x\d+ \(([^)]+)\) – done")
+TOTAL_PROMPT_TOKENS_RE = re.compile(
+    r"Total premium prompt tokens:\s+(?P<tokens>[\d,]+)"
+)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -101,13 +103,19 @@ def parse_timings(text: str):
             data["llm_subq"].append(value)
         elif label.startswith("LLM synthesis – done"):
             data["llm_synth"].append(value)
+        elif label.startswith("LLM efficient synthesis – done"):
+            data["llm_synth"].append(value)
         elif label.startswith("LLM preliminary – done"):
             data["llm_prelim"].append(value)
         elif label.startswith("LLM regenerate rnd 1 – done"):
             data["llm_regen1"].append(value)
+        elif label.startswith("LLM efficient regen rnd 1 – done"):
+            data["llm_regen1"].append(value)
         elif label.startswith("LLM gap-decompose – done"):
             data["llm_gap"].append(value)
         elif label.startswith("pipeline.run – TOTAL"):
+            data["pipeline_total"].append(value)
+        elif label.startswith("pipeline.run_efficient – TOTAL"):
             data["pipeline_total"].append(value)
 
     err_lines = [line for line in clean_text.splitlines() if line.startswith("Error:")]
@@ -115,14 +123,31 @@ def parse_timings(text: str):
     max_retry = clean_text.count("Max retries exceeded")
     processing_match = PROCESSING_RE.search(clean_text)
     questions = int(processing_match.group(1)) if processing_match else None
+    total_prompt_tokens_match = TOTAL_PROMPT_TOKENS_RE.search(clean_text)
+    total_prompt_tokens = (
+        int(total_prompt_tokens_match.group("tokens").replace(",", ""))
+        if total_prompt_tokens_match
+        else None
+    )
     run_wall_total = max(data["run_totals"]) if data["run_totals"] else None
-    wall_per_question = (run_wall_total / questions) if (run_wall_total is not None and questions and questions > 0) else None
+    wall_per_question = (
+        (run_wall_total / questions)
+        if (run_wall_total is not None and questions and questions > 0)
+        else None
+    )
+    prompt_tokens_per_question = (
+        (total_prompt_tokens / questions)
+        if (total_prompt_tokens is not None and questions and questions > 0)
+        else None
+    )
 
     data["_meta"] = {
         "errors": len(err_lines),
         "badrequest": badrequest,
         "max_retry": max_retry,
         "questions": questions,
+        "total_prompt_tokens": total_prompt_tokens,
+        "prompt_tokens_per_question": prompt_tokens_per_question,
         "run_wall_total": run_wall_total,
         "run_wall_per_question": wall_per_question,
     }
@@ -158,6 +183,14 @@ def fmt_range(rng):
     return "NA" if rng is None else f"{rng[0]:.2f}–{rng[1]:.2f}s"
 
 
+def fmt_tokens(value):
+    return "NA" if value is None else f"{value:,.0f}"
+
+
+def fmt_tokens_per_question(value):
+    return "NA" if value is None else f"{value:,.0f} tokens/q"
+
+
 def pct_change(prev, curr):
     if prev is None or curr is None or prev == 0:
         return "NA"
@@ -171,11 +204,11 @@ def range_width(rng):
 
 
 def pct_change_range(prev_rng, curr_rng):
-    prev_w = range_width(prev_rng)
-    curr_w = range_width(curr_rng)
-    if prev_w is None or curr_w is None or prev_w == 0:
+    prev_value = mean(prev_rng)
+    curr_value = mean(curr_rng)
+    if prev_value is None or curr_value is None or prev_value == 0:
         return "NA"
-    return f"{((curr_w - prev_w) / prev_w) * 100:+.1f}%"
+    return f"{((curr_value - prev_value) / prev_value) * 100:+.1f}%"
 
 
 def build_metric_values(data):
@@ -186,24 +219,24 @@ def build_metric_values(data):
     values["Fulltext query – under contention (sub-Q parallel)"] = fmt_range(contention_range(data["fulltext_done"], 5))
     values["Vector query – single (all sources)"] = fmt_single(first_wave_mean(data["vector_done"], 5))
     values["Vector query – under contention (all sources)"] = fmt_range(contention_range(data["vector_done"], 5))
-    values["Vector materialize/read stage (all sources)"] = fmt_range(full_range(data["mat_done"]))
 
     for container in sorted(data["vector_by_container"]):
         vals = data["vector_by_container"][container]
         values[f"Vector query – single ({container})"] = fmt_single(first_wave_mean(vals, 5))
         values[f"Vector query – under contention ({container})"] = fmt_range(contention_range(vals, 5))
 
-    for container in sorted(data["mat_by_container"]):
-        vals = data["mat_by_container"][container]
-        values[f"Vector materialize/read stage ({container})"] = fmt_range(full_range(vals))
-
-    values["LLM sub-Q answer"] = fmt_range(full_range(data["llm_subq"]))
     values["LLM synthesis"] = fmt_single(mean(data["llm_synth"]))
     values["LLM preliminary"] = fmt_single(mean(data["llm_prelim"]))
     values["LLM regenerate rnd 1"] = fmt_single(mean(data["llm_regen1"]))
     values["LLM gap-decompose"] = fmt_range(full_range(data["llm_gap"]))
     questions = data.get("_meta", {}).get("questions")
     question_note = f" [{questions} questions]" if isinstance(questions, int) and questions > 0 else ""
+    values[f"premium prompt tokens TOTAL{question_note}"] = fmt_tokens(
+        data.get("_meta", {}).get("total_prompt_tokens")
+    )
+    values["premium prompt tokens / question"] = fmt_tokens_per_question(
+        data.get("_meta", {}).get("prompt_tokens_per_question")
+    )
     values["run wall TOTAL / question"] = fmt_single(data.get("_meta", {}).get("run_wall_per_question"))
     values[f"pipeline.run TOTAL{question_note}"] = fmt_single(mean(data["pipeline_total"]))
     return values
@@ -214,10 +247,10 @@ def parse_single_seconds(value):
         return None
     if "–" in value or "-" in value:
         return None
-    match = re.search(r"([0-9]*\.?[0-9]+)", value)
+    match = re.search(r"([0-9][0-9,]*\.?[0-9]*)", value)
     if not match:
         return None
-    return float(match.group(1))
+    return float(match.group(1).replace(",", ""))
 
 
 def parse_range_seconds(value):
@@ -233,13 +266,6 @@ def parse_range_seconds(value):
         return float(left), float(right)
     except ValueError:
         return None
-
-
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def strip_ansi(text: str) -> str:
-    return ANSI_RE.sub("", text)
 
 
 def supports_color() -> bool:
@@ -265,6 +291,27 @@ def parse_tsv_lines(lines):
             continue
         rows.append(line.split("\t"))
     return rows
+
+
+def find_previous_runs(current_log_text, completed_logs, timing_logs, limit=2):
+    previous_runs = []
+    seen_texts = {current_log_text}
+    candidate_pool = (
+        completed_logs[:-1]
+        if completed_logs
+        else [(path, path.read_text(encoding="utf-8", errors="ignore")) for path in timing_logs[:-1]]
+    )
+
+    for candidate_path, candidate_text in reversed(candidate_pool):
+        if candidate_text in seen_texts:
+            continue
+        previous_runs.append((candidate_path, candidate_text))
+        seen_texts.add(candidate_text)
+        if len(previous_runs) == limit:
+            break
+
+    previous_runs.reverse()
+    return previous_runs
 
 
 def render_pretty_table(lines):
@@ -336,21 +383,14 @@ def main():
         current_log_path = timing_logs[-1]
         current_log_text = current_log_path.read_text(encoding="utf-8", errors="ignore")
 
-    previous_log_path = None
-    previous_log_text = None
-    candidate_pool = completed_logs[:-1] if completed_logs else [(path, path.read_text(encoding="utf-8", errors="ignore")) for path in timing_logs[:-1]]
-    for candidate, candidate_text in reversed(candidate_pool):
-        if candidate_text != current_log_text:
-            previous_log_path = candidate
-            previous_log_text = candidate_text
-            break
+    previous_runs = find_previous_runs(current_log_text, completed_logs, timing_logs, limit=2)
 
     current_data = parse_timings(current_log_text)
     current_values = build_metric_values(current_data)
     ordered_components = list(current_values.keys())
 
     lines = []
-    if previous_log_text is None:
+    if not previous_runs:
         lines.append(f"Log\t{current_log_path.name}")
         lines.append("")
         lines.append("Component\tThis run")
@@ -361,16 +401,27 @@ def main():
             f"_meta this_badrequest_errors={current_data['_meta']['badrequest']} this_max_retry_exceeded={current_data['_meta']['max_retry']}"
         )
     else:
-        previous_data = parse_timings(previous_log_text)
-        previous_values = build_metric_values(previous_data)
+        previous_summaries = []
+        for previous_log_path, previous_log_text in previous_runs:
+            previous_data = parse_timings(previous_log_text)
+            previous_values = build_metric_values(previous_data)
+            previous_summaries.append((previous_log_path, previous_data, previous_values))
 
-        lines.append(f"Prev log\t{previous_log_path.name}")
+        for index, (previous_log_path, _, _) in enumerate(previous_summaries, start=1):
+            lines.append(f"Prev log {index}\t{previous_log_path.name}")
         lines.append(f"This log\t{current_log_path.name}")
         lines.append("")
-        lines.append("Component\tPrev run\tThis run\tChange")
+
+        header = ["Component"]
+        header.extend(f"Prev run {index}" for index in range(1, len(previous_summaries) + 1))
+        header.extend(["This run", "Change"])
+        lines.append("\t".join(header))
+
+        latest_previous_values = previous_summaries[-1][2]
         for component in ordered_components:
-            prev_value = previous_values.get(component, "NA")
+            previous_values_for_component = [summary[2].get(component, "NA") for summary in previous_summaries]
             curr_value = current_values.get(component, "NA")
+            prev_value = latest_previous_values.get(component, "NA")
 
             prev_range = parse_range_seconds(prev_value)
             curr_range = parse_range_seconds(curr_value)
@@ -379,19 +430,24 @@ def main():
                 change = pct_change_range(prev_range, curr_range)
             else:
                 change = pct_change(parse_single_seconds(prev_value), parse_single_seconds(curr_value))
-            lines.append(f"{component}\t{prev_value}\t{curr_value}\t{change}")
+            row = [component, *previous_values_for_component, curr_value, change]
+            lines.append("\t".join(row))
 
         lines.append("")
-        lines.append(
-            f"_meta prev_errors={previous_data['_meta']['errors']} new_badrequest_errors={current_data['_meta']['badrequest']} new_max_retry_exceeded={current_data['_meta']['max_retry']}"
-        )
+        meta_parts = []
+        for index, (_, previous_data, _) in enumerate(previous_summaries, start=1):
+            meta_parts.append(f"prev{index}_errors={previous_data['_meta']['errors']}")
+        meta_parts.append(f"new_badrequest_errors={current_data['_meta']['badrequest']}")
+        meta_parts.append(f"new_max_retry_exceeded={current_data['_meta']['max_retry']}")
+        lines.append("_meta " + " ".join(meta_parts))
 
     TABLE_PATH.write_text("\n".join(lines), encoding="utf-8")
 
-    if previous_log_path is None:
+    if not previous_runs:
         print(f"Log: {current_log_path.name}")
     else:
-        print(f"Prev log: {previous_log_path.name}")
+        for index, (previous_log_path, _) in enumerate(previous_runs, start=1):
+            print(f"Prev log {index}: {previous_log_path.name}")
         print(f"This log: {current_log_path.name}")
     print()
 

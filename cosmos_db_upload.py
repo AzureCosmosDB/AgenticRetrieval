@@ -27,7 +27,7 @@ from azure.cosmos.aio import CosmosClient
 from azure.cosmos import exceptions
 from azure.core.exceptions import HttpResponseError
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
-from azure.identity.aio import DefaultAzureCredential as AsyncDefaultAzureCredential
+from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential, DefaultAzureCredential as AsyncDefaultAzureCredential
 from azure.mgmt.cosmosdb import CosmosDBManagementClient
 from azure.mgmt.cosmosdb.models import (
     SqlDatabaseCreateUpdateParameters,
@@ -343,10 +343,19 @@ def get_cosmos_client(use_rbac_auth: bool, credential=None) -> CosmosClient:
         raise ValueError("Cosmos DB endpoint not configured. Set COSMOS_ENDPOINT.")
     
     if use_rbac_auth:
-        # Use Entra ID RBAC authentication (DefaultAzureCredential)
+        tenant_id = str(CONFIG.get("cosmos", {}).get("tenant_id") or "").strip()
+        # Use Entra ID RBAC authentication. Prefer a tenant-scoped Azure CLI credential
+        # when tenant_id is configured so the token is issued by the expected tenant.
         if credential is None:
-            credential = AsyncDefaultAzureCredential()
-        print("✓ Using Entra ID RBAC authentication for Cosmos DB")
+            credential = (
+                AsyncAzureCliCredential(tenant_id=tenant_id)
+                if tenant_id
+                else AsyncDefaultAzureCredential()
+            )
+        if tenant_id:
+            print(f"✓ Using tenant-scoped AzureCliCredential authentication for Cosmos DB ({tenant_id})")
+        else:
+            print("✓ Using Entra ID RBAC authentication for Cosmos DB")
         return CosmosClient(COSMOS_ENDPOINT, credential=credential)
     else:
         # Use key-based authentication
@@ -974,7 +983,14 @@ async def main_async():
             print(f"⚠ Container auto-create failed: {e}")
 
     print("\n🔌 Initializing clients...")
-    data_plane_credential = AsyncDefaultAzureCredential() if use_rbac_auth else None
+    tenant_id = str(CONFIG.get("cosmos", {}).get("tenant_id") or "").strip()
+    data_plane_credential = None
+    if use_rbac_auth:
+        data_plane_credential = (
+            AsyncAzureCliCredential(tenant_id=tenant_id)
+            if tenant_id
+            else AsyncDefaultAzureCredential()
+        )
     cosmos_client = get_cosmos_client(use_rbac_auth=use_rbac_auth, credential=data_plane_credential)
 
     # Initialize embedding client (single endpoint/model)

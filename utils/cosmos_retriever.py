@@ -9,6 +9,7 @@ import time
 import warnings
 from typing import Any
 
+import httpx
 import numpy as np
 from azure.cosmos.aio import CosmosClient
 from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential, DefaultAzureCredential
@@ -100,11 +101,13 @@ class CombinedRetriever:
         retrieval_sources: list[dict[str, Any]],
         fulltext_k_override: int | None = None,
         k_diverse: int = 0,
+        k_ranker: int = 0,
         eta: float = 0.0,
         rescale_power: float = 0.0,
         cosmos_az_login: bool = False,
     ):
         self.k_diverse = k_diverse
+        self.k_ranker = k_ranker
         self.eta = eta
         self.rescale_power = rescale_power
         self._cosmos_az_login = cosmos_az_login
@@ -116,6 +119,29 @@ class CombinedRetriever:
         self._credential = None
         self._retrieve_cache = LRUCache(int(CONFIG.get("retrieval", {}).get("cache_size", 2000)))
         self._sources = self._normalize_sources(retrieval_sources, fulltext_k_override)
+        self._ranker_http_client: httpx.AsyncClient | None = None
+        ranker_cfg = CONFIG.get("ranker", {})
+        self._use_ranker = bool(ranker_cfg.get("use_ranker", False))
+        self._ranker_region = str(ranker_cfg.get("region", "")).strip()
+        self._ranker_account = str(ranker_cfg.get("account_name", "")).strip()
+        self._ranker_batch_size = int(ranker_cfg.get("batch_size", 32))
+        self._ranker_access_token: str | None = None
+        if self._use_ranker:
+            read_token_from_path = bool(ranker_cfg.get("read_token_from_path", True))
+            if read_token_from_path:
+                token_path = str(ranker_cfg.get("access_token_path", "access_token.txt")).strip()
+                if token_path and os.path.isfile(token_path):
+                    with open(token_path, "r") as f:
+                        self._ranker_access_token = f.read().strip()
+            else:
+                from azure.identity import AzureCliCredential as SyncAzureCliCredential
+                tenant_id = str(ranker_cfg.get("tenant_id", "")).strip()
+                token_scope = str(ranker_cfg.get("token_scope", "")).strip()
+                if not token_scope:
+                    raise ValueError("ranker.token_scope must be a non-empty string when read_token_from_path is false")
+                credential = SyncAzureCliCredential(tenant_id=tenant_id) if tenant_id else SyncAzureCliCredential()
+                token_obj = credential.get_token(token_scope)
+                self._ranker_access_token = token_obj.token
 
     @property
     def total_fulltext_k(self) -> int:
@@ -170,10 +196,17 @@ class CombinedRetriever:
 
     async def initialize(self):
         use_rbac_auth = CONFIG.get("cosmos", {}).get("use_rbac_auth", False)
-        if self._cosmos_az_login:
-            credential = AsyncAzureCliCredential()
+        tenant_id = str(CONFIG.get("cosmos", {}).get("tenant_id") or "").strip()
+        if self._cosmos_az_login or tenant_id:
+            credential = AsyncAzureCliCredential(tenant_id=tenant_id) if tenant_id else AsyncAzureCliCredential()
             self._credential = credential
-            _log_line("✓ Using 'az login' (AzureCliCredential) authentication for Cosmos DB", kind="success")
+            if tenant_id:
+                _log_line(
+                    f"✓ Using tenant-scoped AzureCliCredential authentication for Cosmos DB ({tenant_id})",
+                    kind="success",
+                )
+            else:
+                _log_line("✓ Using 'az login' (AzureCliCredential) authentication for Cosmos DB", kind="success")
             self._cosmos = CosmosClient(COSMOS_ENDPOINT, credential=credential)
         elif use_rbac_auth:
             credential = DefaultAzureCredential()
@@ -191,20 +224,44 @@ class CombinedRetriever:
             self._containers[source["id"]] = self._db.get_container_client(source["container_name"])
         self._llm = LLMClient()
 
-    async def _fulltext_search(self, container, fields: list[str], query: str, top_k: int) -> list[dict]:
-        if top_k <= 0 or not fields:
+        # Register ranker account (idempotent – safe to call every time)
+        if self._use_ranker and self._ranker_account and self._ranker_access_token:
+            register_account_path = str(CONFIG.get("ranker", {}).get("register_account_path", "")).strip()
+            if self._ranker_region and register_account_path:
+                if self._ranker_http_client is None:
+                    self._ranker_http_client = httpx.AsyncClient(timeout=120)
+                register_url = f"https://{self._ranker_region}.{register_account_path}"
+                register_payload = {
+                    "AccountName": self._ranker_account,
+                    "Region": self._ranker_region,
+                }
+                register_headers = {
+                    "Authorization": f"Bearer {self._ranker_access_token}",
+                    "Content-Type": "application/json",
+                }
+                try:
+                    resp = await self._ranker_http_client.post(register_url, headers=register_headers, json=register_payload)
+                    if resp.status_code == 200:
+                        _log_line(f"✓ Ranker account '{self._ranker_account}' registered", kind="success")
+                    else:
+                        _log_line(f"Ranker account registration returned {resp.status_code}: {resp.text[:200]}", kind="warn")
+                except Exception as e:
+                    _log_line(f"Ranker account registration failed: {e}", kind="warn")
+
+    async def _fulltext_search_single_field(self, container, field: str, query: str, top_k: int) -> list[dict]:
+        """Run a fulltext search on a single field, returning ranked results."""
+        if top_k <= 0:
             return []
         terms = [t for t in re.findall(r"\w+", query) if t.lower() not in STOPWORDS and len(t) > 1]
         if not terms:
             return []
 
         chunks = [terms[i:i + 5] for i in range(0, len(terms), 5)]
-        score_exprs: list[str] = []
-        for field in fields:
-            field_expr = f"c.{field}"
-            for term_chunk in chunks:
-                args = ", ".join(f'"{term}"' for term in term_chunk)
-                score_exprs.append(f"FullTextScore({field_expr}, {args})")
+        field_expr = f"c.{field}"
+        score_exprs = []
+        for term_chunk in chunks:
+            args = ", ".join(f'"{term}"' for term in term_chunk)
+            score_exprs.append(f"FullTextScore({field_expr}, {args})")
         if not score_exprs:
             return []
 
@@ -213,26 +270,63 @@ class CombinedRetriever:
         else:
             order = f"ORDER BY RANK RRF({', '.join(score_exprs)})"
 
+        sql = f"SELECT TOP {top_k} * FROM c {order}"
         try:
-            sql = f"SELECT TOP {top_k} * FROM c {order}"
             if _timing_enabled():
                 _log_line(
-                    f"  fulltext SQL ({container.id}): {sql}  [text={query!r}]",
+                    f"  fulltext SQL ({container.id}/{field}): {sql}  [text={query!r}]",
                     kind="query",
                     use_lock=True,
                 )
 
-            t = _ck(f"fulltext query (top {top_k}, {container.id}) – start")
+            t = _ck(f"fulltext query (top {top_k}, {container.id}/{field}) – start")
             query_iterator = container.query_items(query=sql, parameters=[])
             items = []
             async for item in query_iterator:
                 items.append(item)
 
-            _ck(f"fulltext query – done ({len(items)} results, {container.id})", t)
+            _ck(f"fulltext query – done ({len(items)} results, {container.id}/{field})", t)
             return items
         except Exception as e:
-            _log_line(f"Fulltext error ({container.id}): {e}", kind="error")
+            _log_line(f"Fulltext error ({container.id}/{field}): {e}", kind="error")
             return []
+
+    async def _fulltext_search(self, container, fields: list[str], query: str, top_k: int) -> list[dict]:
+        if top_k <= 0 or not fields:
+            return []
+        terms = [t for t in re.findall(r"\w+", query) if t.lower() not in STOPWORDS and len(t) > 1]
+        if not terms:
+            return []
+
+        # Single field: run directly (no need for client-side RRF)
+        if len(fields) == 1:
+            return await self._fulltext_search_single_field(container, fields[0], query, top_k)
+
+        # Multiple fields: run parallel per-field queries and merge via client-side RRF
+        t = _ck(f"fulltext parallel-RRF (top {top_k}, {container.id}, {len(fields)} fields) – start")
+        per_field_tasks = [
+            asyncio.create_task(self._fulltext_search_single_field(container, field, query, top_k))
+            for field in fields
+        ]
+        per_field_results = await asyncio.gather(*per_field_tasks)
+
+        # Client-side RRF merge: score each doc by 1/(k+rank) across fields, pick top_k
+        rrf_k = 60  # standard RRF constant
+        doc_scores: dict[str, float] = {}
+        doc_map: dict[str, dict] = {}
+        for field_items in per_field_results:
+            for rank, item in enumerate(field_items):
+                doc_id = item.get("id", "")
+                if not doc_id:
+                    continue
+                doc_scores[doc_id] = doc_scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+                if doc_id not in doc_map:
+                    doc_map[doc_id] = item
+
+        sorted_ids = sorted(doc_scores, key=lambda did: doc_scores[did], reverse=True)[:top_k]
+        merged = [doc_map[did] for did in sorted_ids]
+        _ck(f"fulltext parallel-RRF – done ({len(merged)} merged from {sum(len(r) for r in per_field_results)} total, {container.id})", t)
+        return merged
 
     async def _vector_search(
         self,
@@ -439,6 +533,56 @@ class CombinedRetriever:
             chunks = [chunks[i] for i in selected]
             _ck(f"  retrieve: greedy log-det – done (selected {len(chunks)} of {self.k_diverse} requested)", t)
 
+        # Semantic ranker reranking
+        effective_k_ranker = self.k_ranker // k_divisor
+        if effective_k_ranker > 0 and self._use_ranker and len(chunks) > effective_k_ranker and self._ranker_account and self._ranker_access_token:
+            t = _ck("  retrieve: semantic ranker – start")
+            if self._ranker_http_client is None:
+                self._ranker_http_client = httpx.AsyncClient(timeout=120)
+            documents = [c.text for c in chunks]
+            body = {
+                "query": query,
+                "documents": documents,
+                "return_documents": False,
+                "top_k": effective_k_ranker,
+                "batch_size": self._ranker_batch_size,
+            }
+            headers = {
+                "Authorization": f"Bearer {self._ranker_access_token}",
+                "Content-Type": "application/json",
+            }
+            url_suffix = str(CONFIG.get("ranker", {}).get("url_suffix", "")).strip()
+            url = f"https://{self._ranker_account}.{self._ranker_region}.{url_suffix}"
+            max_retries = int(CONFIG.get("ranker", {}).get("max_retries", 5))
+            ranker_succeeded = False
+            for attempt in range(max_retries):
+                try:
+                    response = await self._ranker_http_client.post(url, headers=headers, json=body)
+                    if response.status_code in (502, 503, 429) and attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        _log_line(f"Semantic ranker returned {response.status_code}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})", kind="warn")
+                        await asyncio.sleep(wait)
+                        continue
+                    response.raise_for_status()
+                    result = response.json()
+                    scores = result.get("Scores", [])
+                    # Select top k_ranker by reranker score, preserving original chunk objects
+                    ranked_indices = [s["index"] for s in scores[:effective_k_ranker]]
+                    chunks = [chunks[i] for i in ranked_indices]
+                    _ck(f"  retrieve: semantic ranker – done (selected {len(chunks)} of {effective_k_ranker} requested)", t)
+                    ranker_succeeded = True
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1 and ("503" in str(e) or "502" in str(e) or "429" in str(e)):
+                        wait = 2 ** attempt
+                        _log_line(f"Semantic ranker error (attempt {attempt + 1}/{max_retries}): {e}, retrying in {wait}s", kind="warn")
+                        await asyncio.sleep(wait)
+                        continue
+                    _log_line(f"Semantic ranker error: {e}", kind="error")
+                    break
+            if not ranker_succeeded:
+                _ck("  retrieve: semantic ranker – failed, keeping diversity-selected chunks", t)
+
         self._retrieve_cache.set(cache_key, copy.deepcopy(chunks))
         
         _ck(f"retrieve – TOTAL ({len(chunks)} chunks returned)", t_retrieve)
@@ -454,3 +598,6 @@ class CombinedRetriever:
         if self._credential is not None:
             await self._credential.close()
             self._credential = None
+        if self._ranker_http_client is not None:
+            await self._ranker_http_client.aclose()
+            self._ranker_http_client = None
