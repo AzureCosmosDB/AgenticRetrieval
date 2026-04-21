@@ -780,6 +780,25 @@ async def upload_documents_batch(container, docs: List[Dict[str, Any]]) -> tuple
     return success_count, len(results) - success_count
 
 
+async def _doc_exists(container, doc_id: str) -> bool:
+    """Check if a document already exists via point-read (cheap, 1 RU)."""
+    try:
+        await container.read_item(item=doc_id, partition_key=doc_id)
+        return True
+    except exceptions.CosmosResourceNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+async def _filter_existing_docs(container, batch_docs: list[dict]) -> list[dict]:
+    """Return only docs whose IDs don't already exist in the container."""
+    checks = await asyncio.gather(
+        *(_doc_exists(container, doc.get("id", "")) for doc in batch_docs)
+    )
+    return [doc for doc, exists in zip(batch_docs, checks) if not exists]
+
+
 async def _embed_and_upload_batch(
     batch_docs: list[dict],
     embed_client,
@@ -787,10 +806,17 @@ async def _embed_and_upload_batch(
     embedding_field: str,
     text_fields: list[str],
     max_embed_retries: int = 5,
+    skip_existing: bool = True,
 ) -> tuple[int, int, float, float]:
     """Embed + upload a single batch with retry for rate-limit errors."""
-    batch_texts = [generate_embedding_text(d, text_fields) for d in batch_docs]
     embed_secs = upload_secs = 0.0
+
+    if skip_existing:
+        batch_docs = await _filter_existing_docs(container, batch_docs)
+        if not batch_docs:
+            return 0, 0, 0.0, 0.0
+
+    batch_texts = [generate_embedding_text(d, text_fields) for d in batch_docs]
 
     embeddings = None
     for attempt in range(max_embed_retries):
@@ -1016,7 +1042,7 @@ async def main_async():
                       f"[parser={parser_spec}, glob={file_glob_pattern or '*'}]")
 
                 print(f"\n📄 Processing {target_name} documents "
-                      f"(batch size: {batch_size}, concurrent batches: {CONCURRENT_BATCHES})...")
+                      f"(batch size: {batch_size}, concurrent batches: {CONCURRENT_BATCHES}, skip existing: on)...")
                 batch_queue: list[dict] = []
                 in_flight: set[asyncio.Task] = set()
                 batch_sem = asyncio.Semaphore(max(1, CONCURRENT_BATCHES))

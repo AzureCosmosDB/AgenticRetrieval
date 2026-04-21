@@ -1,16 +1,78 @@
 # =============================================================================
-# PubMed / PMC Open Access — Cosmos DB Upload Configuration
+# PubMed / PMC Open Access — Configuration
 # =============================================================================
 #
-# Used by:  python cosmos_db_upload.py --config pubmed/scripts/config.pubmed.yaml
+# Used by:
+#   Upload:    python cosmos_db_upload.py --config pubmed/scripts/config.pubmed.yaml
+#   Retrieval: python agentic_retriever.py --config pubmed/scripts/config.pubmed.yaml
 #
-# This config drives cosmos_db_upload infrastructure for:
+# This config drives:
 #   - Azure OpenAI embedding generation
 #   - Cosmos DB container creation (management plane)
 #   - Document upload (data plane)
+#   - Agentic retrieval pipeline (query time)
 #
 # The document_parser field tells cosmos_db_upload.py to use a custom parser
 # (JATS XML → dict) instead of the default JSON loader.
+
+# ---------------------------------------------------------------------------
+# Retrieval parameters (used at query time by agentic_retriever.py)
+# ---------------------------------------------------------------------------
+retrieval:
+  k_diverse: 10         # 0 = disabled; >0 = select this many diverse chunks via log-det
+  eta: 0.0              # Gram matrix regularization
+  rescale_power: 5.0    # Query-similarity rescale power
+
+# ---------------------------------------------------------------------------
+# Pipeline parameters
+# ---------------------------------------------------------------------------
+pipeline:
+  max_sub_questions: 5
+  subq_fanout_cap: 3
+  subq_max_concurrency: 5
+  rounds: 2
+  preliminary_prefix: ""
+  subquery_prefix: ""
+  dataset_description: "PubMed / PMC Open Access biomedical research articles"
+
+# ---------------------------------------------------------------------------
+# Execution parameters
+# ---------------------------------------------------------------------------
+execution:
+  max_questions: null    # null = process all questions
+  max_workers: 1
+
+# ---------------------------------------------------------------------------
+# Paths (relative to working directory)
+# ---------------------------------------------------------------------------
+paths:
+  questions_path: "pubmed/questions.txt"
+  output_root: "pubmed/output"
+
+# ---------------------------------------------------------------------------
+# Azure OpenAI / LLM settings
+# ---------------------------------------------------------------------------
+llm:
+  llm_endpoint: ""
+  api_version: "2024-05-01-preview"
+  llm_model: "gpt-5.4-mini"
+  temperature: 0.0
+  max_completion_tokens: 4096
+  max_retries: 2
+  premium_max_concurrency: 4
+  prompt_cache_size: 2048
+  use_rbac_auth: true
+  token_scope: ""
+  llm_api_key: ""
+
+# ---------------------------------------------------------------------------
+# Local LLM fallback settings
+# ---------------------------------------------------------------------------
+local_llm:
+  local_fallback_endpoint: "http://localhost:11434/api/generate"
+  local_fallback_model: ""
+  use_local_fallback_for_subtasks: true
+  local_max_concurrency: 8
 
 # ---------------------------------------------------------------------------
 # Embedding settings (Azure OpenAI)
@@ -21,7 +83,7 @@ embedding:
   embed_model: "text-embedding-3-small"
   embed_dimensions: 1536
   embed_cache_size: 4096
-  use_rbac_auth: false
+  use_rbac_auth: true
   embed_api_key: ""
   token_scope: "https://cognitiveservices.azure.com/.default"
 
@@ -83,8 +145,8 @@ cosmos:
 
       # Retrieval settings (used at query time by the RAG pipeline)
       retrieval:
-        vector_k: 25
-        fulltext_k: 10
+        vector_k: 5
+        fulltext_k: 0
         fulltext_fields:
           - title
           - abstract
