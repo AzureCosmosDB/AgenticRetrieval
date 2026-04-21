@@ -4,8 +4,6 @@ paths:
   output_root: ""
 
 prune_k: 20
-rerank_multiplier: 8
-context_limit: 270000
 
 # Azure OpenAI / LLM settings
 llm:
@@ -20,6 +18,7 @@ llm:
   use_rbac_auth: true
   token_scope: ""
   llm_api_key: ""
+  context_limit: 270000
 
 # Embedding settings
 embedding:
@@ -35,6 +34,7 @@ embedding:
 # Semantic ranker
 ranker:
   use_ranker: true
+  rerank_multiplier: 8
   k_ranker: 10
   region: ""
   account_name: ""
