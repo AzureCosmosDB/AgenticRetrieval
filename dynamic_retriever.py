@@ -84,8 +84,12 @@ async def do_search(query, containers):
             did = d.get("id","")
             if did not in seen: seen.add(did); all_d.append(d)
     total_k = sum(r["search_k"]+r["fulltext_search_k"] for r in _source_cfg.values())
-    ranked = await rerank(query, [fmt(d) for d in all_d], total_k)
-    return json.dumps([{"docid": re.search(r'^id: (.+)$', d, re.MULTILINE).group(1) if re.search(r'^id: (.+)$', d, re.MULTILINE) else "", "snippet": d[:2000]} for d in ranked])
+    texts = [fmt(d) for d in all_d]
+    ranked_texts = await rerank(query, texts, total_k)
+    # Map ranked texts back to source docs by index
+    text_to_idx = {id(t): i for i, t in enumerate(texts)}
+    ranked_indices = [text_to_idx[id(t)] for t in ranked_texts]
+    return json.dumps([{"docid": all_d[i].get("id", ""), "snippet": ranked_texts[j][:2000]} for j, i in enumerate(ranked_indices)])
 
 async def do_get_doc(docid, containers):
     for container_id, c in containers.items():
@@ -244,25 +248,36 @@ async def process_question(q_obj, containers):
 
 async def main():
     questions = json.loads(Path(cfg["paths"]["questions_path"]).read_text())
+    if args.max_questions is not None:
+        questions = questions[:args.max_questions]
     use_rbac_auth = cosmos_cfg.get("use_rbac_auth", False)
-    credential = AsyncAzureCliCredential() if use_rbac_auth else cosmos_cfg["key"]
-    cosmos = CosmosClient(cosmos_cfg["uri"], credential=credential)
+    credential = AsyncAzureCliCredential() if use_rbac_auth else None
+    cosmos = CosmosClient(cosmos_cfg["uri"], credential=credential or cosmos_cfg["key"])
     db = cosmos.get_database_client(cosmos_cfg["database_name"])
     containers = {s["id"]: db.get_container_client(s["container_name"]) for s in sources}
 
-    results = []
-    for q in tqdm(questions):
-        results.append(await process_question(q, containers))
+    try:
+        results = []
+        for q in tqdm(questions):
+            results.append(await process_question(q, containers))
 
-    out = Path(cfg["paths"]["output_root"]) / "standard" / f"results_{time.strftime('%Y%m%d_%H%M%S')}.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(results, indent=2))
-    print(f"\nSaved {len(results)} results to {out}")
-    await cosmos.close()
+        out = Path(cfg["paths"]["output_root"]) / "standard" / f"results_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(results, indent=2))
+        print(f"\nSaved {len(results)} results to {out}")
+    finally:
+        await cosmos.close()
+        if credential is not None:
+            await credential.close()
+        await llm.close()
+        await embed_client.close()
+        if USE_RANKER:
+            await _r_http.aclose()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config_dynamic.yaml")
+    parser.add_argument("--max-questions", type=int, default=None, help="Only answer the first N questions")
     args = parser.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
