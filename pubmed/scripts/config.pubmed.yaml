@@ -1,0 +1,199 @@
+# =============================================================================
+# PubMed / PMC Open Access — Configuration
+# =============================================================================
+#
+# Used by:
+#   Upload:    python cosmos_db_upload.py --config pubmed/scripts/config.pubmed.yaml
+#   Retrieval: python agentic_retriever.py --config pubmed/scripts/config.pubmed.yaml
+#
+# This config drives:
+#   - Azure OpenAI embedding generation
+#   - Cosmos DB container creation (management plane)
+#   - Document upload (data plane)
+#   - Agentic retrieval pipeline (query time)
+#
+# The document_parser field tells cosmos_db_upload.py to use a custom parser
+# (JATS XML → dict) instead of the default JSON loader.
+
+# ---------------------------------------------------------------------------
+# Retrieval parameters (used at query time by agentic_retriever.py)
+# ---------------------------------------------------------------------------
+retrieval:
+  k_diverse: 10         # 0 = disabled; >0 = select this many diverse chunks via log-det
+  eta: 0.0              # Gram matrix regularization
+  rescale_power: 5.0    # Query-similarity rescale power
+
+# ---------------------------------------------------------------------------
+# Pipeline parameters
+# ---------------------------------------------------------------------------
+pipeline:
+  max_sub_questions: 5
+  subq_fanout_cap: 3
+  subq_max_concurrency: 5
+  rounds: 2
+  preliminary_prefix: ""
+  subquery_prefix: ""
+  dataset_description: "PubMed / PMC Open Access biomedical research articles"
+
+# ---------------------------------------------------------------------------
+# Execution parameters
+# ---------------------------------------------------------------------------
+execution:
+  max_questions: null    # null = process all questions
+  max_workers: 1
+
+# ---------------------------------------------------------------------------
+# Paths (relative to working directory)
+# ---------------------------------------------------------------------------
+paths:
+  questions_path: "pubmed/questions.txt"
+  output_root: "pubmed/output"
+
+# ---------------------------------------------------------------------------
+# Azure OpenAI / LLM settings
+# ---------------------------------------------------------------------------
+llm:
+  llm_endpoint: ""
+  api_version: "2024-05-01-preview"
+  llm_model: "gpt-5.4-mini"
+  temperature: 0.0
+  max_completion_tokens: 4096
+  max_retries: 2
+  premium_max_concurrency: 4
+  prompt_cache_size: 2048
+  use_rbac_auth: true
+  token_scope: ""
+  llm_api_key: ""
+
+# ---------------------------------------------------------------------------
+# Local LLM fallback settings
+# ---------------------------------------------------------------------------
+local_llm:
+  local_fallback_endpoint: "http://localhost:11434/api/generate"
+  local_fallback_model: ""
+  use_local_fallback_for_subtasks: true
+  local_max_concurrency: 8
+
+# ---------------------------------------------------------------------------
+# Embedding settings (Azure OpenAI)
+# ---------------------------------------------------------------------------
+embedding:
+  embed_endpoint: ""
+  api_version: "2024-05-01-preview"
+  embed_model: "text-embedding-3-small"
+  embed_dimensions: 1536
+  embed_cache_size: 4096
+  use_rbac_auth: true
+  embed_api_key: ""
+  token_scope: "https://cognitiveservices.azure.com/.default"
+
+# ---------------------------------------------------------------------------
+# Cosmos DB settings
+# ---------------------------------------------------------------------------
+cosmos:
+  # Upload settings used by cosmos_db_upload.py
+  cosmos_account_name: ""
+  cosmos_resource_group: ""
+  azure_subscription_id: ""
+  uri: ""
+  key: ""                                   # leave empty when using RBAC
+  database_name: "pubmed"
+  use_rbac_auth: true
+
+  # Throughput tuning
+  throughput_mode: "autoscale"        # "autoscale" or "manual"
+  throughput_value: 60000             # max RU/s for autoscale
+
+  # Upload tuning
+  embedding_batch_size: 30
+  concurrent_batches: 5                     # number of embed+upload batches in flight at once
+
+  # Vector embedding policy applied to all sources below
+  vector_embedding_policy_json: |
+    {
+      "vectorEmbeddings": [
+        {
+          "path": "/embedding",
+          "dataType": "float32",
+          "dimensions": 1536,
+          "distanceFunction": "cosine"
+        }
+      ]
+    }
+
+  # ---------------------------------------------------------------------------
+  # Sources — one entry per Cosmos DB container
+  # ---------------------------------------------------------------------------
+  sources:
+    - id: "pmc_articles"
+      container_name: "articles"
+      partition_key_path: "/id"
+      embedding_field: "embedding"
+
+      # Custom parser: parse JATS XML files instead of JSON
+      document_parser: "pubmed/scripts/parse_article.py:parse_article"
+      file_glob: "**/*.xml"
+      documents_root: "pubmed/downloads"   # directory of extracted XML files
+
+      # Fields concatenated to build embedding input text
+      embedding_text_fields:
+        - journal_title
+        - title
+        - toc_abstract
+        - abstract
+        - full_text
+
+      # Retrieval settings (used at query time by the RAG pipeline)
+      retrieval:
+        vector_k: 5
+        fulltext_k: 0
+        fulltext_fields:
+          - title
+          - abstract
+          - full_text
+
+      # Indexing policy
+      #   - Range index on all simple fields (/*)
+      #   - Excluded: large text blobs and nested arrays that don't need range indexing
+      #   - Full-text indexes on title, abstract, full_text
+      #   - DiskANN vector index on /embedding
+      indexing_policy_json: |
+        {
+          "indexingMode": "consistent",
+          "automatic": true,
+          "includedPaths": [
+            { "path": "/*" }
+          ],
+          "excludedPaths": [
+            { "path": "/\"_etag\"/?" },
+            { "path": "/embedding/*" },
+            { "path": "/sections/*" },
+            { "path": "/references/*" },
+            { "path": "/authors/*" },
+            { "path": "/journal/*" }
+          ],
+          "fullTextIndexes": [
+            { "path": "/title" },
+            { "path": "/abstract" },
+            { "path": "/full_text" }
+          ],
+          "vectorIndexes": [
+            {
+              "path": "/embedding",
+              "type": "diskANN",
+              "quantizationByteSize": 192,
+              "indexingSearchListSize": 100
+            }
+          ]
+        }
+
+      # Full-text search policy
+      full_text_policy_json: |
+        {
+          "defaultLanguage": "en-US",
+          "fullTextPaths": [
+            { "path": "/title",     "language": "en-US" },
+            { "path": "/abstract",  "language": "en-US" },
+            { "path": "/full_text", "language": "en-US" }
+          ]
+        }

@@ -1,6 +1,7 @@
 azure-cosmos
 azure-identity
 azure-mgmt-cosmosdb
+azure-mgmt-resource
 aiohttp
 httpx
 numpy
