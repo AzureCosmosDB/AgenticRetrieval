@@ -1,0 +1,402 @@
+[
+  {
+    "id": 1,
+    "question": "What is the protocol for baked milk study enrolment for eosinophilic esophagitis?"
+  },
+  {
+    "id": 2,
+    "question": "Trace the lineage of studies for positive results for sublingual immunotherapy for peanut allergy to the original studies."
+  },
+  {
+    "id": 3,
+    "question": "What are the comparative outcomes of biologic therapies versus conventional DMARDs in early rheumatoid arthritis?"
+  },
+  {
+    "id": 4,
+    "question": "How has the understanding of gut microbiome composition in Crohn's disease evolved over the past decade?"
+  },
+  {
+    "id": 5,
+    "question": "What evidence supports the use of ketogenic diet as adjunctive therapy for drug-resistant epilepsy in adults?"
+  },
+  {
+    "id": 6,
+    "question": "What are the current risk stratification models for sudden cardiac death in hypertrophic cardiomyopathy?"
+  },
+  {
+    "id": 7,
+    "question": "How do checkpoint inhibitor-related pneumonitis management guidelines differ across oncology societies?"
+  },
+  {
+    "id": 8,
+    "question": "What is the evidence base for using SGLT2 inhibitors in heart failure with preserved ejection fraction?"
+  },
+  {
+    "id": 9,
+    "question": "What are the long-term neurodevelopmental outcomes of extremely preterm infants exposed to antenatal magnesium sulfate?"
+  },
+  {
+    "id": 10,
+    "question": "How has the diagnostic criteria for autoimmune encephalitis been refined since the initial consensus statements?"
+  },
+  {
+    "id": 11,
+    "question": "What is the current evidence for fecal microbiota transplantation in recurrent Clostridioides difficile infection compared to vancomycin taper?"
+  },
+  {
+    "id": 12,
+    "question": "What are the mechanisms linking obstructive sleep apnea to atrial fibrillation and what interventional studies address this?"
+  },
+  {
+    "id": 13,
+    "question": "How do different scoring systems compare for predicting mortality in acute pancreatitis?"
+  },
+  {
+    "id": 14,
+    "question": "What is the trajectory of research on CAR-T cell therapy for multiple myeloma from early trials to current practice?"
+  },
+  {
+    "id": 15,
+    "question": "What are the established protocols for desensitization in patients with aspirin-exacerbated respiratory disease?"
+  },
+  {
+    "id": 16,
+    "question": "How does the evidence for transcatheter aortic valve replacement compare to surgical replacement in intermediate-risk patients?"
+  },
+  {
+    "id": 17,
+    "question": "What are the key studies linking maternal vitamin D deficiency to offspring autoimmune disease risk?"
+  },
+  {
+    "id": 18,
+    "question": "What is the current understanding of the role of Epstein-Barr virus in the pathogenesis of multiple sclerosis?"
+  },
+  {
+    "id": 19,
+    "question": "How have treatment algorithms for diabetic macular edema changed with the introduction of anti-VEGF therapies?"
+  },
+  {
+    "id": 20,
+    "question": "What evidence supports the use of therapeutic hypothermia after out-of-hospital cardiac arrest and what are the target temperature debates?"
+  },
+  {
+    "id": 21,
+    "question": "What are the comparative efficacy data for different JAK inhibitors in moderate-to-severe ulcerative colitis?"
+  },
+  {
+    "id": 22,
+    "question": "How do prognostic biomarkers in idiopathic pulmonary fibrosis guide treatment escalation decisions?"
+  },
+  {
+    "id": 23,
+    "question": "What is the evidence for early palliative care integration in advanced non-small cell lung cancer on survival outcomes?"
+  },
+  {
+    "id": 24,
+    "question": "What are the proposed mechanisms and clinical evidence for the gut-brain axis in Parkinson's disease?"
+  },
+  {
+    "id": 25,
+    "question": "How has the management of acute ischemic stroke evolved with the expansion of thrombectomy time windows?"
+  },
+  {
+    "id": 26,
+    "question": "What studies have evaluated the efficacy of PCSK9 inhibitors on cardiovascular outcomes beyond LDL reduction?"
+  },
+  {
+    "id": 27,
+    "question": "What is the evidence for universal screening versus risk-based screening for gestational diabetes mellitus?"
+  },
+  {
+    "id": 28,
+    "question": "How do different immunosuppressive regimens compare for preventing rejection in pediatric kidney transplantation?"
+  },
+  {
+    "id": 29,
+    "question": "What are the clinical trials supporting the use of gene therapy for spinal muscular atrophy and their long-term follow-up data?"
+  },
+  {
+    "id": 30,
+    "question": "What is the current evidence on the relationship between PFAS exposure and thyroid dysfunction?"
+  },
+  {
+    "id": 31,
+    "question": "How do liquid biopsy approaches compare to tissue biopsy for detecting actionable mutations in metastatic breast cancer?"
+  },
+  {
+    "id": 32,
+    "question": "What are the long-term cardiovascular outcomes of patients treated for childhood Hodgkin lymphoma with radiation?"
+  },
+  {
+    "id": 33,
+    "question": "What is the current consensus on duration of anticoagulation therapy after unprovoked venous thromboembolism?"
+  },
+  {
+    "id": 34,
+    "question": "How has the understanding of MASLD pathophysiology shifted the approach to pharmacological treatment targets?"
+  },
+  {
+    "id": 35,
+    "question": "What are the key studies evaluating the microbiome's role in immunotherapy response in melanoma?"
+  },
+  {
+    "id": 36,
+    "question": "What evidence exists for the neuroprotective effects of GLP-1 receptor agonists in neurodegenerative diseases?"
+  },
+  {
+    "id": 37,
+    "question": "How do different endoscopic bariatric procedures compare in terms of weight loss durability and complication rates?"
+  },
+  {
+    "id": 38,
+    "question": "What are the current strategies for managing immune-related adverse events from combination checkpoint inhibitor therapy?"
+  },
+  {
+    "id": 39,
+    "question": "What is the evidence linking air pollution exposure to incident dementia and cognitive decline?"
+  },
+  {
+    "id": 40,
+    "question": "How have criteria for selecting patients for mechanical circulatory support as destination therapy evolved?"
+  },
+  {
+    "id": 41,
+    "question": "What are the comparative outcomes of proton beam therapy versus photon radiation for pediatric brain tumors?"
+  },
+  {
+    "id": 42,
+    "question": "What is the evidence base for using CRISPR-based approaches to treat sickle cell disease?"
+  },
+  {
+    "id": 43,
+    "question": "How do randomized trials compare tight versus liberal glycemic control in critically ill patients?"
+  },
+  {
+    "id": 44,
+    "question": "What are the proposed pathophysiological mechanisms linking COVID-19 infection to long-term cardiac complications?"
+  },
+  {
+    "id": 45,
+    "question": "What studies have examined the efficacy of psilocybin-assisted therapy for treatment-resistant depression?"
+  },
+  {
+    "id": 46,
+    "question": "How do different fixation strategies compare for displaced femoral neck fractures in elderly patients?"
+  },
+  {
+    "id": 47,
+    "question": "What is the current evidence for using artificial intelligence in diabetic retinopathy screening programs?"
+  },
+  {
+    "id": 48,
+    "question": "What are the outcomes of watchful waiting versus immediate intervention for small renal masses?"
+  },
+  {
+    "id": 49,
+    "question": "How has the treatment paradigm for chronic hepatitis B shifted with the development of novel antiviral agents?"
+  },
+  {
+    "id": 50,
+    "question": "What are the key studies evaluating dual antiplatelet therapy duration after drug-eluting stent implantation?"
+  },
+  {
+    "id": 51,
+    "question": "What is the evidence for maternal omega-3 supplementation in preventing preterm birth?"
+  },
+  {
+    "id": 52,
+    "question": "How do bispecific antibodies compare to CAR-T cell therapy in relapsed/refractory diffuse large B-cell lymphoma?"
+  },
+  {
+    "id": 53,
+    "question": "What are the proposed mechanisms and clinical trial data for senolytics in age-related diseases?"
+  },
+  {
+    "id": 54,
+    "question": "What is the evidence for mindfulness-based interventions in reducing chronic pain compared to cognitive behavioral therapy?"
+  },
+  {
+    "id": 55,
+    "question": "How do prognostic models for sepsis-associated acute kidney injury guide renal replacement therapy initiation?"
+  },
+  {
+    "id": 56,
+    "question": "What are the long-term outcomes and complications of gender-affirming hormone therapy in transgender adults?"
+  },
+  {
+    "id": 57,
+    "question": "What evidence supports restrictive versus liberal transfusion strategies in gastrointestinal hemorrhage?"
+  },
+  {
+    "id": 58,
+    "question": "How has the classification and management of pulmonary hypertension changed with recent hemodynamic threshold revisions?"
+  },
+  {
+    "id": 59,
+    "question": "What are the clinical studies evaluating adoptive cell transfer for HPV-associated cancers?"
+  },
+  {
+    "id": 60,
+    "question": "What is the evidence for using polygenic risk scores to guide breast cancer screening strategies?"
+  },
+  {
+    "id": 61,
+    "question": "How do different weaning protocols compare for liberation from mechanical ventilation in ICU patients?"
+  },
+  {
+    "id": 62,
+    "question": "What are the studies examining the association between childhood antibiotic exposure and development of inflammatory bowel disease?"
+  },
+  {
+    "id": 63,
+    "question": "What is the current evidence on optimal blood pressure targets in patients with chronic kidney disease and diabetes?"
+  },
+  {
+    "id": 64,
+    "question": "How do neoadjuvant immunotherapy approaches compare to standard chemotherapy in resectable non-small cell lung cancer?"
+  },
+  {
+    "id": 65,
+    "question": "What are the mechanisms of resistance to EGFR tyrosine kinase inhibitors in non-small cell lung cancer and what are the sequential treatment strategies?"
+  },
+  {
+    "id": 66,
+    "question": "What is the evidence for whole-genome sequencing in neonatal intensive care for rapid diagnosis of genetic conditions?"
+  },
+  {
+    "id": 67,
+    "question": "How do different approaches to decolonization compare for reducing recurrent MRSA skin and soft tissue infections?"
+  },
+  {
+    "id": 68,
+    "question": "What are the key trials evaluating RNA-based therapeutics for hereditary transthyretin amyloidosis?"
+  },
+  {
+    "id": 69,
+    "question": "What is the relationship between frailty indices and surgical outcomes in elderly patients undergoing cardiac surgery?"
+  },
+  {
+    "id": 70,
+    "question": "How has the use of extracorporeal membrane oxygenation expanded beyond its original indications and what outcomes data exist?"
+  },
+  {
+    "id": 71,
+    "question": "What evidence supports the use of continuous glucose monitoring in improving outcomes for type 2 diabetes management?"
+  },
+  {
+    "id": 72,
+    "question": "What are the studies evaluating the impact of social determinants of health on cancer treatment disparities?"
+  },
+  {
+    "id": 73,
+    "question": "How do different TNF inhibitor biosimilars compare in terms of immunogenicity and clinical efficacy switching from originators?"
+  },
+  {
+    "id": 74,
+    "question": "What is the evidence for catheter-directed thrombolysis versus systemic anticoagulation in submassive pulmonary embolism?"
+  },
+  {
+    "id": 75,
+    "question": "What are the studies linking prenatal stress exposure to epigenetic changes and offspring mental health outcomes?"
+  },
+  {
+    "id": 76,
+    "question": "How do machine learning models compare to traditional risk scores for predicting hospital readmissions in heart failure?"
+  },
+  {
+    "id": 77,
+    "question": "What is the evidence base for using telemedicine-delivered cognitive behavioral therapy for insomnia?"
+  },
+  {
+    "id": 78,
+    "question": "What are the current strategies for mitigating off-target effects of CRISPR gene editing in therapeutic applications?"
+  },
+  {
+    "id": 79,
+    "question": "How do different corticosteroid regimens compare for managing acute exacerbations of COPD?"
+  },
+  {
+    "id": 80,
+    "question": "What are the key studies evaluating tumor-treating fields as adjunctive therapy in glioblastoma?"
+  },
+  {
+    "id": 81,
+    "question": "What is the evidence for exercise-based cardiac rehabilitation in reducing mortality after myocardial infarction?"
+  },
+  {
+    "id": 82,
+    "question": "How has the identification of molecular subtypes of medulloblastoma changed risk stratification and treatment approaches?"
+  },
+  {
+    "id": 83,
+    "question": "What are the clinical outcomes of using xenotransplantation with genetically modified pig organs in humans?"
+  },
+  {
+    "id": 84,
+    "question": "What is the evidence for prophylactic cranial irradiation versus surveillance in limited-stage small cell lung cancer?"
+  },
+  {
+    "id": 85,
+    "question": "How do different approaches to managing chronic pelvic pain in endometriosis compare in terms of long-term outcomes?"
+  },
+  {
+    "id": 86,
+    "question": "What are the studies evaluating the impact of gut dysbiosis on efficacy of levodopa therapy in Parkinson's disease?"
+  },
+  {
+    "id": 87,
+    "question": "What is the evidence for using high-flow nasal cannula versus non-invasive ventilation in acute hypoxemic respiratory failure?"
+  },
+  {
+    "id": 88,
+    "question": "How do different minimal residual disease assessment techniques guide treatment decisions in acute lymphoblastic leukemia?"
+  },
+  {
+    "id": 89,
+    "question": "What are the clinical trials evaluating intrathecal enzyme replacement therapy for neuronopathic lysosomal storage disorders?"
+  },
+  {
+    "id": 90,
+    "question": "What is the evidence linking the oral microbiome to systemic inflammation and cardiovascular disease risk?"
+  },
+  {
+    "id": 91,
+    "question": "How do structured exercise programs compare to pharmacologic therapy for managing depression in adolescents?"
+  },
+  {
+    "id": 92,
+    "question": "What are the studies evaluating mRNA vaccine platforms for therapeutic cancer vaccines?"
+  },
+  {
+    "id": 93,
+    "question": "What is the current evidence on the optimal timing of surgery for acute type A aortic dissection?"
+  },
+  {
+    "id": 94,
+    "question": "How do different noninvasive prenatal testing approaches compare in detecting subchromosomal copy number variants?"
+  },
+  {
+    "id": 95,
+    "question": "What are the proposed mechanisms and clinical evidence for repurposing metformin as an anti-aging intervention?"
+  },
+  {
+    "id": 96,
+    "question": "What is the evidence for using point-of-care ultrasound to guide fluid resuscitation in septic shock?"
+  },
+  {
+    "id": 97,
+    "question": "How have outcomes of organ transplantation from hepatitis C positive donors changed with the availability of direct-acting antivirals?"
+  },
+  {
+    "id": 98,
+    "question": "What are the comparative safety and efficacy profiles of different complement inhibitors in paroxysmal nocturnal hemoglobinuria?"
+  },
+  {
+    "id": 99,
+    "question": "What is the evidence for using closed-loop insulin delivery systems in pregnancy complicated by type 1 diabetes?"
+  },
+  {
+    "id": 100,
+    "question": "How do different antibiotic prophylaxis strategies compare for preventing surgical site infections in colorectal surgery?"
+  }
+]
