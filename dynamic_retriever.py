@@ -18,13 +18,19 @@ def count_tokens(msgs):
 # --- Search helpers ---
 async def embed(text):
     r = await embed_client.embeddings.create(input=[text], model=embed_cfg["embed_model"])
-    return [float(x) for x in r.data[0].embedding[:embed_cfg.get("embed_dimensions", 1536)]]
-
-async def vec_search(container, emb, top_k, ef):
-    sql = f"SELECT TOP @k c, VectorDistance(c.{ef}, @emb) AS score FROM c ORDER BY VectorDistance(c.{ef}, @emb)"
-    return [item.get("c", item) async for item in container.query_items(query=sql, parameters=[{"name":"@k","value":top_k},{"name":"@emb","value":emb}])]
+    dim = embed_cfg.get("embed_dimensions", 1536)
+    raw = [float(x) for x in r.data[0].embedding]
+    if len(raw) >= dim:
+        return raw[:dim]
+    return raw + [0.0] * (dim - len(raw))
 
 _SAFE_FIELD_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$')
+
+async def vec_search(container, emb, top_k, ef):
+    if not _SAFE_FIELD_RE.match(ef):
+        raise ValueError(f"Invalid embedding field name: {ef!r}")
+    sql = f"SELECT TOP @k c, VectorDistance(c.{ef}, @emb) AS score FROM c ORDER BY VectorDistance(c.{ef}, @emb)"
+    return [item.get("c", item) async for item in container.query_items(query=sql, parameters=[{"name":"@k","value":top_k},{"name":"@emb","value":emb}])]
 
 async def ft_field(container, field, query, top_k):
     if not _SAFE_FIELD_RE.match(field):
@@ -99,11 +105,17 @@ async def do_prune(docids, containers, doc_cache):
         if did in doc_cache:
             parts.append(f'<doc id="{did}">\n{doc_cache[did]}\n</doc>')
             continue
+        found = False
         for container_id, c in containers.items():
+            if found:
+                break
             try:
                 async for item in c.query_items(query="SELECT * FROM c WHERE c.id=@id", parameters=[{"name":"@id","value":did}]):
-                    text = fmt(item); doc_cache[did] = text
-                    parts.append(f'<doc id="{did}">\n{text}\n</doc>'); break
+                    text = fmt(item)
+                    doc_cache[did] = text
+                    parts.append(f'<doc id="{did}">\n{text}\n</doc>')
+                    found = True
+                    break
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -132,7 +144,14 @@ async def process_question(q_obj, containers):
             r = await llm.chat.completions.create(model=llm_cfg["llm_model"], messages=msgs, tools=TOOLS, tool_choice="auto", temperature=llm_cfg.get("temperature", 0), max_completion_tokens=llm_cfg["max_completion_tokens"])
             retries = 0
         except (oai.BadRequestError, oai.RateLimitError, oai.APIStatusError) as e:
-            retries += 1; print(f"  LLM error: {e}"); await asyncio.sleep(min(5*2**retries, 300)); continue
+            retries += 1; print(f"  LLM error ({retries}/{MAX_RETRIES}): {e}")
+            if retries >= MAX_RETRIES:
+                elapsed = round(time.perf_counter() - t0, 2)
+                print(f"  Max retries ({MAX_RETRIES}) exceeded, returning partial result")
+                return {"question_id": qid, "query": query, "answer": "", "ground_truth": q_obj.get("answer",""),
+                        "model": llm_cfg["llm_model"], "rounds": iteration+1, "elapsed_seconds": elapsed,
+                        "tool_calls": tc, "error": f"Max retries exceeded: {e}"}
+            await asyncio.sleep(min(5*2**retries, 300)); continue
         m = r.choices[0].message
         msgs.append(m.model_dump(exclude_none=True))
         if not m.tool_calls:
@@ -145,8 +164,34 @@ async def process_question(q_obj, containers):
                     "tool_calls": tc}
         for t in m.tool_calls:
             tc[t.function.name] = tc.get(t.function.name, 0) + 1
+        # Enforce: prune must be the sole tool call in a turn
+        call_names = [t.function.name for t in m.tool_calls]
+        if "prune" in call_names and len(call_names) > 1:
+            print(f"  [warn] prune mixed with other calls; returning error for non-prune calls")
+            for t in m.tool_calls:
+                if t.function.name != "prune":
+                    msgs.append({"role": "tool", "tool_call_id": t.id,
+                                 "content": json.dumps({"error": "prune must be the only tool call in a turn; re-issue this call separately."})})
+            # Execute only the prune call
+            prune_call = next(t for t in m.tool_calls if t.function.name == "prune")
+            try:
+                a = json.loads(prune_call.function.arguments)
+            except (json.JSONDecodeError, TypeError) as e:
+                msgs.append({"role": "tool", "tool_call_id": prune_call.id,
+                             "content": json.dumps({"error": f"Malformed tool arguments: {e}"})})
+                continue
+            out = await do_prune(a["docids"], containers, doc_cache)
+            msgs.clear()
+            msgs.append(initial_msg)
+            msgs.append({"role": "assistant", "content": "I'll prune the context to focus on the most relevant documents."})
+            msgs.append({"role": "user", "content": out})
+            print(f"  [prune] Kept {len(a['docids'])} docs, context reset")
+            continue
         async def _exec(t):
-            a = json.loads(t.function.arguments)
+            try:
+                a = json.loads(t.function.arguments)
+            except (json.JSONDecodeError, TypeError) as e:
+                return t, json.dumps({"error": f"Malformed tool arguments: {e}"}), False
             if t.function.name == "search":
                 out = await do_search(a["query"], containers)
                 try:
@@ -174,15 +219,22 @@ async def process_question(q_obj, containers):
                 msgs.append(initial_msg)
                 msgs.append({"role": "assistant", "content": "I'll prune the context to focus on the most relevant documents."})
                 msgs.append({"role": "user", "content": out})
-                print(f"  [prune] Kept {len(json.loads(t.function.arguments)['docids'])} docs, context reset")
+                try:
+                    prune_args = json.loads(t.function.arguments)
+                    print(f"  [prune] Kept {len(prune_args['docids'])} docs, context reset")
+                except (json.JSONDecodeError, TypeError, KeyError):
+                    print(f"  [prune] context reset")
                 pruned = True
                 break
         if pruned:
             continue
         for t, out, _ in results:
             msgs.append({"role": "tool", "tool_call_id": t.id, "content": out})
-            a = json.loads(t.function.arguments)
-            print(f"  [{t.function.name}] {list(a.values())[0][:80] if isinstance(list(a.values())[0], str) else '...'}")
+            try:
+                a = json.loads(t.function.arguments)
+                print(f"  [{t.function.name}] {list(a.values())[0][:80] if isinstance(list(a.values())[0], str) else '...'}")
+            except (json.JSONDecodeError, TypeError):
+                print(f"  [{t.function.name}] (malformed args)")
         token_est = count_tokens(msgs)
         msgs.append({"role": "user", "content": f"Token usage: {token_est} / {CONTEXT_LIMIT}"})
         print(f"  Token usage: {token_est} / {CONTEXT_LIMIT}")
@@ -192,7 +244,9 @@ async def process_question(q_obj, containers):
 
 async def main():
     questions = json.loads(Path(cfg["paths"]["questions_path"]).read_text())
-    cosmos = CosmosClient(cosmos_cfg["uri"], credential=AsyncAzureCliCredential())
+    use_rbac_auth = cosmos_cfg.get("use_rbac_auth", False)
+    credential = AsyncAzureCliCredential() if use_rbac_auth else cosmos_cfg["key"]
+    cosmos = CosmosClient(cosmos_cfg["uri"], credential=credential)
     db = cosmos.get_database_client(cosmos_cfg["database_name"])
     containers = {s["id"]: db.get_container_client(s["container_name"]) for s in sources}
 
@@ -226,7 +280,9 @@ if __name__ == "__main__":
     tp = get_bearer_token_provider(AzureCliCredential(), llm_cfg["token_scope"]) if llm_cfg["use_rbac_auth"] else None
     llm = AsyncAzureOpenAI(api_version=llm_cfg["api_version"], azure_endpoint=llm_cfg["llm_endpoint"],
         **({"azure_ad_token_provider": tp} if tp else {"api_key": llm_cfg["llm_api_key"]}))
-    embed_client = AsyncAzureOpenAI(api_version=embed_cfg["api_version"], azure_endpoint=embed_cfg["embed_endpoint"], api_key=embed_cfg["embed_api_key"])
+    embed_tp = get_bearer_token_provider(AzureCliCredential(), embed_cfg["token_scope"]) if embed_cfg.get("use_rbac_auth") else None
+    embed_client = AsyncAzureOpenAI(api_version=embed_cfg["api_version"], azure_endpoint=embed_cfg["embed_endpoint"],
+        **({"azure_ad_token_provider": embed_tp} if embed_tp else {"api_key": embed_cfg["embed_api_key"]}))
 
     # Ranker
     rcfg = cfg["ranker"]
@@ -234,7 +290,12 @@ if __name__ == "__main__":
     if USE_RANKER:
         _r_url = f"https://{rcfg['account_name']}.{rcfg['region']}.{rcfg['url_suffix']}"
         _r_bs, _r_mr = rcfg["batch_size"], rcfg["max_retries"]
-        _r_tok = Path(rcfg["access_token_path"]).read_text().strip() if rcfg["read_token_from_path"] else __import__("azure.identity",fromlist=["AzureCliCredential"]).AzureCliCredential(tenant_id=rcfg["tenant_id"]).get_token(rcfg["token_scope"]).token
+        if rcfg["read_token_from_path"]:
+            _r_tok = Path(rcfg["access_token_path"]).read_text().strip()
+        else:
+            _ranker_tenant = str(rcfg.get("tenant_id") or "").strip()
+            _ranker_cred = AzureCliCredential(tenant_id=_ranker_tenant) if _ranker_tenant else AzureCliCredential()
+            _r_tok = _ranker_cred.get_token(rcfg["token_scope"]).token
         _r_hdr = {"Authorization": f"Bearer {_r_tok}", "Content-Type": "application/json"}
         _r_http = httpx.AsyncClient(timeout=120)
 
