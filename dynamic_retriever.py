@@ -8,8 +8,8 @@ from openai import AsyncAzureOpenAI
 from azure.identity import AzureCliCredential, get_bearer_token_provider
 from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential
 from azure.cosmos.aio import CosmosClient
-
-STOPWORDS = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "a's", "able", "about", "above", "according", "accordingly", "across", "actually", "after", "afterwards", "again", "against", "ain't", "all", "allow", "allows", "almost", "alone", "along", "already", "also", "although", "always", "am", "among", "amongst", "an", "and", "another", "any", "anybody", "anyhow", "anyone", "anything", "anyway", "anyways", "anywhere", "apart", "appear", "appreciate", "appropriate", "are", "aren't", "around", "as", "aside", "ask", "asking", "associated", "at", "available", "away", "awfully", "b", "be", "became", "because", "become", "becomes", "becoming", "been", "before", "beforehand", "behind", "being", "believe", "below", "beside", "besides", "best", "better", "between", "beyond", "both", "brief", "but", "by", "c", "c'mon", "c's", "came", "can", "can't", "cannot", "cant", "cause", "causes", "certain", "certainly", "changes", "clearly", "co", "com", "come", "comes", "concerning", "consequently", "consider", "considering", "contain", "containing", "contains", "corresponding", "could", "couldn't", "course", "currently", "d", "definitely", "described", "despite", "did", "didn't", "different", "do", "does", "doesn't", "doing", "don", "don't", "done", "down", "downwards", "during", "e", "each", "edu", "eg", "eight", "either", "else", "elsewhere", "enough", "entirely", "especially", "et", "etc", "even", "ever", "every", "everybody", "everyone", "everything", "everywhere", "ex", "exactly", "example", "except", "f", "far", "few", "fifth", "first", "five", "followed", "following", "follows", "for", "former", "formerly", "forth", "four", "from", "further", "furthermore", "g", "get", "gets", "getting", "given", "gives", "go", "goes", "going", "gone", "got", "gotten", "greetings", "h", "had", "hadn't", "happens", "hardly", "has", "hasn't", "have", "haven't", "having", "he", "he's", "hello", "help", "hence", "her", "here", "here's", "hereafter", "hereby", "herein", "hereupon", "hers", "herself", "hi", "him", "himself", "his", "hither", "hopefully", "how", "howbeit", "however", "i", "i'd", "i'll", "i'm", "i've", "ie", "if", "ignored", "immediate", "in", "inasmuch", "inc", "indeed", "indicate", "indicated", "indicates", "inner", "insofar", "instead", "into", "inward", "is", "isn't", "it", "it'd", "it'll", "it's", "its", "itself", "j", "just", "k", "keep", "keeps", "kept", "know", "known", "knows", "l", "last", "lately", "later", "latter", "latterly", "least", "less", "lest", "let", "let's", "like", "liked", "likely", "little", "ll", "look", "looking", "looks", "ltd", "m", "mainly", "make", "many", "may", "maybe", "me", "mean", "meanwhile", "merely", "might", "more", "moreover", "most", "mostly", "mr", "mrs", "ms", "much", "must", "my", "myself", "n", "name", "namely", "nd", "near", "nearly", "necessary", "need", "needs", "neither", "never", "nevertheless", "new", "next", "nine", "no", "nobody", "non", "none", "noone", "nor", "normally", "not", "nothing", "novel", "now", "nowhere", "o", "obviously", "of", "off", "often", "oh", "ok", "okay", "old", "on", "once", "one", "ones", "only", "onto", "or", "other", "others", "otherwise", "ought", "our", "ours", "ourselves", "out", "outside", "over", "overall", "own", "p", "particular", "particularly", "per", "perhaps", "placed", "please", "plus", "possible", "presumably", "probably", "provides", "q", "que", "quite", "qv", "r", "rather", "rd", "re", "really", "reasonably", "regarding", "regardless", "regards", "relatively", "respectively", "right", "s", "said", "same", "saw", "say", "saying", "says", "second", "secondly", "see", "seeing", "seem", "seemed", "seeming", "seems", "seen", "self", "selves", "sensible", "sent", "serious", "seriously", "seven", "several", "shall", "she", "should", "shouldn't", "since", "six", "so", "some", "somebody", "somehow", "someone", "something", "sometime", "sometimes", "somewhat", "somewhere", "soon", "sorry", "specified", "specify", "specifying", "still", "sub", "such", "sup", "sure", "t", "t's", "take", "taken", "tell", "tends", "th", "than", "thank", "thanks", "thanx", "that", "that's", "thats", "the", "their", "theirs", "them", "themselves", "then", "thence", "there", "there's", "thereafter", "thereby", "therefore", "therein", "theres", "thereupon", "these", "they", "they'd", "they'll", "they're", "they've", "think", "third", "this", "thorough", "thoroughly", "those", "though", "three", "through", "throughout", "thru", "thus", "to", "together", "too", "took", "toward", "towards", "tried", "tries", "truly", "try", "trying", "twice", "two", "u", "un", "under", "unfortunately", "unless", "unlikely", "until", "unto", "up", "upon", "us", "use", "used", "useful", "uses", "using", "usually", "v", "value", "various", "ve", "very", "via", "viz", "vs", "w", "want", "wants", "was", "wasn't", "way", "we", "we'd", "we'll", "we're", "we've", "welcome", "well", "went", "were", "weren't", "what", "what's", "whatever", "when", "whence", "whenever", "where", "where's", "whereafter", "whereas", "whereby", "wherein", "whereupon", "wherever", "whether", "which", "while", "whither", "who", "who's", "whoever", "whole", "whom", "whose", "why", "will", "willing", "wish", "with", "within", "without", "won't", "wonder", "would", "wouldn't", "x", "y", "yes", "yet", "you", "you'd", "you'll", "you're", "you've", "your", "yours", "yourself", "yourselves", "z", "zero"}
+from utils.fulltext import fulltext_search
+from utils.ranker import rerank_documents
 
 _enc = tiktoken.get_encoding("o200k_base")
 def count_tokens(msgs):
@@ -32,37 +32,12 @@ async def vec_search(container, emb, top_k, ef):
     sql = f"SELECT TOP @k c, VectorDistance(c.{ef}, @emb) AS score FROM c ORDER BY VectorDistance(c.{ef}, @emb)"
     return [item.get("c", item) async for item in container.query_items(query=sql, parameters=[{"name":"@k","value":top_k},{"name":"@emb","value":emb}])]
 
-async def ft_field(container, field, query, top_k):
-    if not _SAFE_FIELD_RE.match(field):
-        raise ValueError(f"Invalid fulltext field name: {field!r}")
-    terms = [t for t in re.findall(r"\w+", query) if t.lower() not in STOPWORDS and len(t) > 1]
-    if not terms or top_k <= 0: return []
-    chunks = [terms[i:i+5] for i in range(0, len(terms), 5)]
-    exprs = [f'FullTextScore(c.{field}, {", ".join(chr(34)+t.replace(chr(34),"")+chr(34) for t in ch)})' for ch in chunks]
-    order = f"ORDER BY RANK {exprs[0]}" if len(exprs)==1 else f"ORDER BY RANK RRF({', '.join(exprs)})"
-    try: return [item async for item in container.query_items(query=f"SELECT TOP {top_k} * FROM c {order}", parameters=[])]
-    except: return []
-
-async def ft_search(container, fields, query, top_k):
-    if not fields or top_k <= 0: return []
-    if len(fields) == 1: return await ft_field(container, fields[0], query, top_k)
-    pf = await asyncio.gather(*(ft_field(container, f, query, top_k) for f in fields))
-    sc, dm = {}, {}
-    for items in pf:
-        for r, it in enumerate(items):
-            d = it.get("id","")
-            if d: sc[d] = sc.get(d,0) + 1/(60+r+1); dm.setdefault(d, it)
-    return [dm[d] for d in sorted(sc, key=sc.get, reverse=True)[:top_k]]
-
 async def rerank(query, docs, top_k):
     if not USE_RANKER or not docs: return docs[:top_k]
-    body = {"query": query, "documents": docs, "return_documents": False, "top_k": top_k, "batch_size": _r_bs}
-    for att in range(_r_mr):
-        resp = await _r_http.post(_r_url, headers=_r_hdr, json=body)
-        if resp.status_code in (429,502,503) and att+1 < _r_mr: await asyncio.sleep(2**att); continue
-        resp.raise_for_status()
-        return [docs[s["index"]] for s in resp.json().get("Scores",[])[:top_k] if s["index"] < len(docs)]
-    return docs
+    indices = await rerank_documents(_r_http, _r_url, _r_tok, query, docs, top_k, _r_bs, _r_mr)
+    if indices is None:
+        return docs[:top_k]
+    return [docs[i] for i in indices]
 
 def fmt(doc):
     ex = {"_rid","_self","_etag","_attachments","_ts","_score","e"} | _all_embed
@@ -76,7 +51,7 @@ async def do_search(query, containers):
             tasks.append(vec_search(containers[sid], emb, ret["search_k"]*RERANK_MUL, _source_embed[sid]))
     for sid, fields in _source_ft.items():
         if sid in containers:
-            tasks.append(ft_search(containers[sid], fields, query, _source_cfg[sid]["fulltext_search_k"]*RERANK_MUL))
+            tasks.append(fulltext_search(containers[sid], fields, query, _source_cfg[sid]["fulltext_search_k"]*RERANK_MUL))
     results = await asyncio.gather(*tasks)
     seen, all_d = set(), []
     for dl in results:
@@ -201,13 +176,17 @@ async def process_question(q_obj, containers):
                 try:
                     for h in json.loads(out):
                         if h.get("snippet"): doc_cache[h["docid"]] = h["snippet"]
-                except: pass
+                except asyncio.CancelledError: raise
+                except Exception as e:
+                    print(f"  [search] failed to parse/cache search results: {e}")
             elif t.function.name == "get_document":
                 out = await do_get_doc(a["docid"], containers)
                 try:
                     d = json.loads(out)
                     if d.get("text"): doc_cache[d["docid"]] = d["text"]
-                except: pass
+                except asyncio.CancelledError: raise
+                except Exception as e:
+                    print(f"  [get_document] failed to parse/cache doc result for {a.get('docid','?')}: {e}")
             elif t.function.name == "prune":
                 out = await do_prune(a["docids"], containers, doc_cache)
                 return t, out, True  # signal prune
