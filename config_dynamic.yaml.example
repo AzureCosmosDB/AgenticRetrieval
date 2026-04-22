@@ -1,0 +1,163 @@
+# Paths (relative to working directory)
+paths:
+  questions_path: ""
+  output_root: ""
+
+prune_k: 20
+
+# Azure OpenAI / LLM settings
+llm:
+  llm_endpoint: ""
+  api_version: ""
+  llm_model: ""
+  temperature: 0.0
+  max_completion_tokens: 2048
+  max_retries: 2
+  premium_max_concurrency: 8
+  prompt_cache_size: 4096
+  use_rbac_auth: true
+  token_scope: ""
+  llm_api_key: ""
+  context_limit: 270000
+
+# Embedding settings
+embedding:
+  embed_endpoint: ""
+  api_version: ""
+  embed_model: ""
+  embed_dimensions: 1024
+  embed_cache_size: 4096
+  use_rbac_auth: false
+  token_scope: ""
+  embed_api_key: ""
+
+# Semantic ranker
+ranker:
+  use_ranker: true
+  rerank_multiplier: 8
+  k_ranker: 10
+  region: ""
+  account_name: ""
+  read_token_from_path: false
+  access_token_path: ""
+  tenant_id: ""
+  token_scope: ""
+  register_account_path: ""
+  url_suffix: ""
+  batch_size: 16
+  max_retries: 10
+
+# Cosmos DB settings
+cosmos:
+  uri: ""
+  key: ""
+  database_name: ""
+  use_rbac_auth: false
+
+  # Upload settings
+  cosmos_account_name: ""
+  cosmos_resource_group: ""
+  azure_subscription_id: ""
+  embedding_batch_size: 20
+
+  vector_embedding_policy_json: |
+    {
+      "vectorEmbeddings": [
+        {
+          "path": "/embedding",
+          "dataType": "float32",
+          "dimensions": 1024,
+          "distanceFunction": "cosine"
+        }
+      ]
+    }
+
+  # Configure each source/container independently
+  sources:
+    - id: "source_1"
+      container_name: "container_1"
+      partition_key_path: "/pk"
+      embedding_field: "embedding"
+      documents_root: ""
+      embedding_text_fields:
+        - title
+        - summary
+        - content
+      retrieval:
+        search_k: 10
+        fulltext_search_k: 10
+        fulltext_fields:
+          - title
+      indexing_policy_json: |
+        {
+          "indexingMode": "consistent",
+          "automatic": true,
+          "includedPaths": [
+            { "path": "/*" }
+          ],
+          "excludedPaths": [
+            { "path": "/\"_etag\"/?" },
+            { "path": "/embedding/*" }
+          ],
+          "fullTextIndexes": [
+            { "path": "/title" }
+          ],
+          "vectorIndexes": [
+            {
+              "path": "/embedding",
+              "type": "diskANN",
+              "quantizationByteSize": 192,
+              "indexingSearchListSize": 100
+            }
+          ]
+        }
+      full_text_policy_json: |
+        {
+          "defaultLanguage": "en-US",
+          "fullTextPaths": [
+            { "path": "/title", "language": "en-US" }
+          ]
+        }
+
+    - id: "source_2"
+      container_name: "container_2"
+      partition_key_path: "/pk"
+      embedding_field: "embedding"
+      documents_root: ""
+      embedding_text_fields:
+        - text
+      retrieval:
+        search_k: 25
+        fulltext_search_k: 0
+        fulltext_fields: 
+          - text
+      indexing_policy_json: |
+        {
+          "indexingMode": "consistent",
+          "automatic": true,
+          "includedPaths": [
+            { "path": "/*" }
+          ],
+          "excludedPaths": [
+            { "path": "/\"_etag\"/?" },
+            { "path": "/embedding/*" }
+          ],
+          "fullTextIndexes": [
+            { "path": "/text" }
+          ],
+          "vectorIndexes": [
+            {
+              "path": "/embedding",
+              "type": "diskANN",
+              "quantizationByteSize": 192,
+              "indexingSearchListSize": 100
+            }
+          ]
+        }
+      full_text_policy_json: |
+        {
+          "defaultLanguage": "en-US",
+          "fullTextPaths": [
+            { "path": "/text", "language": "en-US" }
+          ]
+        }
