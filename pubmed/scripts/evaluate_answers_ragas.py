@@ -100,8 +100,8 @@ def _make_llm(cred, endpoint, deployment, api_version, token_scope):
 
 def build_llm(llm_cfg):
     """Create a ragas LLM using Azure AD token via litellm."""
-    endpoint = llm_cfg.get("endpoint", "")
-    deployment = llm_cfg.get("model", "gpt-5.4")
+    endpoint = llm_cfg.get("llm_endpoint", "")
+    deployment = llm_cfg.get("llm_model", "gpt-5.4")
     api_version = llm_cfg.get("api_version", "2024-12-01-preview")
     token_scope = llm_cfg.get("token_scope", "https://cognitiveservices.azure.com/.default")
     cred = AzureCliCredential()

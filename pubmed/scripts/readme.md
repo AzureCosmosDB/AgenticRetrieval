@@ -22,7 +22,6 @@ python evaluate_answers_ragas.py --base output/answers/answers_top15.json --othe
 
 This should produce comparison similar to this:
 
-
 <pre>
 =====================================================================
 RAGAS Comparison: vector15 vs refs_5_4
