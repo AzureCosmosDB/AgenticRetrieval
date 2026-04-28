@@ -38,7 +38,8 @@ async def fulltext_search_single_field(container, field: str, query: str, top_k:
         return items
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as e:
+        print(f"  [fulltext_search_single_field] query failed: {e}")
         return []
 
 

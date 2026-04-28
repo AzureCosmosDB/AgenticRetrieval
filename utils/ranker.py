@@ -48,7 +48,8 @@ async def rerank_documents(
             resp.raise_for_status()
             scores = resp.json().get("Scores", [])
             return [s["index"] for s in scores[:top_k] if s["index"] < len(documents)]
-        except Exception:
+        except Exception as e:
+            print(f"  [rerank_documents] attempt {attempt+1} failed: {e}")
             if attempt + 1 < max_retries:
                 await asyncio.sleep(2 ** attempt)
                 continue
