@@ -54,11 +54,11 @@ paths:
 # ---------------------------------------------------------------------------
 llm:
   llm_endpoint: ""
-  api_version: "2024-05-01-preview"
-  llm_model: "gpt-5.4-mini"
+  api_version: "2024-12-01-preview"
+  llm_model: ""
   temperature: 0.0
   max_completion_tokens: 4096
-  max_retries: 2
+  max_retries: 5
   premium_max_concurrency: 4
   prompt_cache_size: 2048
   use_rbac_auth: true
@@ -79,10 +79,11 @@ local_llm:
 # ---------------------------------------------------------------------------
 embedding:
   embed_endpoint: ""
-  api_version: "2024-05-01-preview"
+  api_version: "2024-12-01-preview"
   embed_model: "text-embedding-3-small"
   embed_dimensions: 1536
   embed_cache_size: 4096
+  max_input_chars: 8000
   use_rbac_auth: true
   embed_api_key: ""
   token_scope: "https://cognitiveservices.azure.com/.default"
@@ -197,3 +198,14 @@ cosmos:
             { "path": "/full_text", "language": "en-US" }
           ]
         }
+
+# ---------------------------------------------------------------------------
+# Answer generation settings
+# ---------------------------------------------------------------------------
+answer:
+  pmc_ids_csv: "data/PMC-ids.csv"
+  max_context_chars: 230000
+  system_prompt: |
+    You are a biomedical research assistant. You are given a question and a set of retrieved PubMed articles (title, abstract, and potentially full text excerpts).
+
+    Synthesize the information from these articles to provide a comprehensive, evidence-based answer to the question. Cite the papers by their PMCID when referencing specific findings. If the retrieved articles do not contain sufficient information to fully answer the question, state what is covered and what gaps remain.
