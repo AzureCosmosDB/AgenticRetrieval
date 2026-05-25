@@ -352,5 +352,5 @@ Check that:
 ## Next Reading
 
 - [Concepts](Concepts.md) explains the terms used above.
-- [Docs overview](Readme.md) links the full documentation set.
+- [Docs overview](README.md) links the full documentation set.
 - The root README remains the shortest setup path.
