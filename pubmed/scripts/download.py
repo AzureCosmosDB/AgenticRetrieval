@@ -4,7 +4,7 @@ PMC Commercial Open Access Bulk Downloader
 Downloads all baseline and incremental XML packages from the PMC OA Commercial
 subset (CC0, CC BY, CC BY-SA, CC BY-ND licensed articles).
 
-Source directory: https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_bulk/oa_comm/xml/
+Source directory: https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_bulk/oa_comm/xml/
 
 Usage
 -----
@@ -46,7 +46,7 @@ from tqdm import tqdm
 # Configuration
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_bulk/oa_comm/"
+BASE_URL = "https://ftp.ncbi.nlm.nih.gov/pub/pmc/deprecated/oa_bulk/oa_comm/"
 CHUNK_SIZE = 1024 * 1024  # 1 MB read chunks
 RETRY_ATTEMPTS = 5
 RETRY_BACKOFF = 10  # seconds between retries (doubles each attempt)

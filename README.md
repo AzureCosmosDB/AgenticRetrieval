@@ -1,24 +1,47 @@
-# DiverseRAG
+# Agentic Retrieval
 
-DiverseRAG is a two-stage Azure Cosmos DB + Azure OpenAI pipeline:
+![Agentic Retrieval overview](AgenticRetrievalOverview.png)
+
+Agentic Retrieval is a multi-stage agentic retrieval accelerator for answering complex questions that typically require multi-hop reasoning. It is a self-correcting RAG system that iteratively identifies knowledge gaps, retrieves targeted evidence, and generates more complete answers — built on Azure Cosmos DB for NoSQL and Microsoft Foundry.
+
+Instead of relying on a single search-and-answer pass, the pipeline interleaves retrieval and reasoning across multiple rounds: it drafts a preliminary answer, analyzes what is still missing or under-supported, decomposes the gap into focused sub-questions, retrieves new evidence per sub-question across one or more Cosmos DB containers, and finally synthesizes a grounded answer from the accumulated context.
+
+## Useful for scenarios with…
+
+- **Complex questions** that span multiple topics or require information from many documents and modalities.
+- **High-stakes applications** where answer completeness and accuracy matter (legal, medical, financial, real-estate, etc.).
+- **Large heterogeneous corpora** where a single search query can't surface all relevant information.
+- **Enterprise knowledge bases** with structured and unstructured data across multiple collections.
+
+## How it works
+
+Agentic Retrieval has two stages:
 
 1. **Ingestion (`cosmos_db_upload.py`)**
-   - Reads JSON documents from one or more configured source folders.
-   - Builds embeddings and stores them in field `e`.
-   - Upserts documents into Cosmos DB containers with vector + full-text indexing support.
+   - Reads documents from one or more configured sources (JSONL by default; custom parsers for other formats such as XML).
+   - Builds embeddings with the configured Azure OpenAI / Foundry endpoint and stores them in the per-source embedding field (e.g. `e`).
+   - Upserts documents into Azure Cosmos DB containers with vector and full-text indexing enabled.
 
-2. **Retrieval + Answering (`agentic_retriever.py`)**
-   - Runs decomposed RAG using full-text retrieval, vector retrieval, and diversity selection.
-   - Generates answers for question files and writes grouped outputs under `out/`.
+2. **Retrieval and answering (`agentic_retriever.py`)**
+   - Runs a decomposed RAG loop combining vector search, full-text search, diversity selection, and optional semantic reranking across all configured sources.
+   - Iteratively generates sub-questions to fill knowledge gaps, retrieves targeted evidence for each, and synthesizes a final answer.
+   - Writes per-question traces and grouped answer files under `out/`.
 
 ## What this project does
 
-- Uploads your corpus to Cosmos DB through **configurable sources** (`cosmos.sources`), each mapping to a container.
+- Uploads your corpus to Azure Cosmos DB through **configurable sources** (`cosmos.sources`), each mapping to its own container, partition key, and indexing policy.
 - Embeds all sources with one configured embedding endpoint/model.
 - Answers evaluation questions by combining:
-  - Initial retrieval
-  - Gap-aware sub-question decomposition
-  - Regeneration/synthesis into a final answer
+  - Initial multi-source retrieval (vector + full-text).
+  - Diversity selection and optional semantic reranking to keep the most informative chunks.
+  - Gap-aware sub-question decomposition over multiple rounds.
+  - Synthesis of the accumulated evidence into a final answer.
+
+## Documentation
+
+- [Docs overview](docs/README.md) — quick table of contents for the root/sample-data pipeline docs.
+- [Concepts](docs/Concepts.md) — definitions for the main concepts and technical terms used in this repo.
+- [How to use](docs/How-to-use.md) — expanded setup, dependency, configuration, upload, retrieval, and troubleshooting guide.
 
 ## Prerequisites
 
@@ -39,9 +62,29 @@ Or use setup helpers:
 
 ## Sequence of actions
 
-### 1) Populate `config.yaml`
+### 1) Choose and populate a config file
 
-Start from `config.yaml.example` and fill required values in `config.yaml`.
+Configuration files are not committed with real credentials. Start from the
+matching `.example` file, copy it to the same path without `.example`, then fill
+in the required values.
+
+For the sample data under `data/` (including the solar-system JSONL examples),
+use the root config template:
+
+```bash
+cp config.yaml.example config.yaml
+```
+
+For the PubMed / PMC Open Access dataset, use the PubMed config template:
+
+```bash
+cp pubmed/scripts/config.pubmed.yaml.example pubmed/scripts/config.pubmed.yaml
+```
+
+Use the copied file for upload and retrieval. The root `config.yaml.example` is
+configured for the sample data layout in `data/`, while
+`pubmed/scripts/config.pubmed.yaml.example` is configured for PubMed XML parsing
+and the `/embedding` vector path.
 
 At minimum, set:
 
@@ -75,7 +118,7 @@ Each entry in `cosmos.sources` is configured independently and includes:
   - Set `cosmos.use_rbac_auth: false` to use key-based auth (requires `cosmos.key`).
   - For RBAC: Ensure your identity has the "Cosmos DB Built-in Data Contributor" role assigned.
 
-- **Azure OpenAI**: Uses key-based auth by default (`llm.use_rbac_auth: false`).
+- **Microsoft Foundry - Azure OpenAI models**: Uses key-based auth by default (`llm.use_rbac_auth: false`).
   - Set `llm.use_rbac_auth: true` to use Entra ID RBAC (requires `llm.token_scope`).
 
 Optional but recommended for auto-creating missing containers:
@@ -188,8 +231,9 @@ Immediately before each Cosmos DB call, the actual query is also printed as a `[
 - `cosmos_db_upload.py` — ingestion + embedding + Cosmos upsert
 - `agentic_retriever.py` — decomposed RAG retrieval/answer pipeline
 - `timing_summary.py` — timed rerun + timing comparison table generation
-- `config.yaml.example` — full config template
+- `config.yaml.example` — sample data config template for files under `data/`
 - `data/` — sample input corpus
+- `docs/` — concepts and detailed usage docs for the root/sample-data pipeline
 - `out/` — generated outputs
 
 ## Troubleshooting

@@ -11,7 +11,7 @@ full-text biomedical articles from [PubMed Central](https://www.ncbi.nlm.nih.gov
 that are available for commercial reuse under permissive licenses.
 
 | Resource | Link |
-|---|---|
+| --- | --- |
 | PMC OA Subset overview | <https://www.ncbi.nlm.nih.gov/pmc/tools/openftlist/> |
 | Commercial-use file list (oa_comm) | <https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_bulk/oa_comm/> |
 | PMC OA license terms | <https://www.ncbi.nlm.nih.gov/pmc/tools/textmining/> |
@@ -36,9 +36,20 @@ pip install -r requirements.txt   # from repo root
 ```
 
 You also need:
+
 - An **Azure Cosmos DB** account (NoSQL API) with vector search enabled
 - An **Azure OpenAI** embedding deployment (e.g. `text-embedding-3-small`)
 - Credentials configured in `pubmed/scripts/config.pubmed.yaml`
+
+Create the PubMed config from the example before filling in credentials and
+resource names:
+
+```bash
+cp pubmed/scripts/config.pubmed.yaml.example pubmed/scripts/config.pubmed.yaml
+```
+
+Use this PubMed config for PMC XML data. The root `config.yaml.example` is for
+the sample data under `data/`, not for the PubMed ingestion pipeline.
 
 ## 1. Download XML articles
 
@@ -120,6 +131,7 @@ python pubmed/scripts/build_citation_graph.py \
 ```
 
 The citation graph script:
+
 1. Downloads the NCBI PMC-ids.csv mapping (PMID ↔ PMCID)
 2. Scans all XML files to extract references
 3. Resolves PMID-only references to PMCIDs
@@ -134,7 +146,7 @@ The citation graph script:
 See `pubmed/scripts/config.pubmed.yaml` for all settings. Key fields:
 
 | Field | Description |
-|---|---|
+| --- | --- |
 | `cosmos.uri` | Cosmos DB endpoint URL |
 | `cosmos.database_name` | Database name (default: `pubmed`) |
 | `cosmos.use_rbac_auth` | Use Entra ID RBAC instead of keys |
