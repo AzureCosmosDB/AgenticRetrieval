@@ -53,9 +53,9 @@ paths:
 # Azure OpenAI / LLM settings
 # ---------------------------------------------------------------------------
 llm:
-  llm_endpoint: "https://jacodel-foundry.openai.azure.com/"
+  llm_endpoint: ""
   api_version: "2024-05-01-preview"
-  llm_model: "gpt-5.4-nano"
+  llm_model: "gpt-5.4-mini"
   temperature: 0.0
   max_completion_tokens: 4096
   max_retries: 2
@@ -80,7 +80,7 @@ local_llm:
 # Embedding settings (Azure OpenAI)
 # ---------------------------------------------------------------------------
 embedding:
-  embed_endpoint: "https://jacodel-foundry.openai.azure.com/"
+  embed_endpoint: ""
   api_version: "2024-05-01-preview"
   embed_model: "text-embedding-3-small"
   embed_dimensions: 1536
@@ -94,10 +94,10 @@ embedding:
 # ---------------------------------------------------------------------------
 cosmos:
   # Upload settings used by cosmos_db_upload.py
-  cosmos_account_name: "cosmos-tests"
-  cosmos_resource_group: "jacodel-test"
-  azure_subscription_id: "220fc532-6091-423c-8ba0-66c2397d591b"
-  uri: "https://cosmos-tests.documents.azure.com:443/"
+  cosmos_account_name: ""
+  cosmos_resource_group: ""
+  azure_subscription_id: ""
+  uri: ""
   key: ""                                   # leave empty when using RBAC
   database_name: "pubmed"
   use_rbac_auth: true
