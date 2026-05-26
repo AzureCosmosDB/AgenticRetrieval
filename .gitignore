@@ -246,7 +246,8 @@ Thumbs.db
 
 # Project-specific secrets and outputs
 config.yaml
-pubmed/scripts/config.pubmed.yaml
+config.pubmed.yaml
+**/config.pubmed.yaml
 out/
 out/*.*
 data/skf_full.json

@@ -1,6 +1,4 @@
---
-
-## Introduction
+# Introduction
 
 ### What is Agentic Retrieval?
 

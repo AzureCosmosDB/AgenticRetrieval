@@ -13,7 +13,7 @@ that are available for commercial reuse under permissive licenses.
 | Resource | Link |
 | --- | --- |
 | PMC OA Subset overview | <https://www.ncbi.nlm.nih.gov/pmc/tools/openftlist/> |
-| Commercial-use file list (oa_comm) | <https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_bulk/oa_comm/> |
+| Commercial-use file list (oa_comm) | <https://ftp.ncbi.nlm.nih.gov/pub/pmc/depcrecated/oa_bulk/oa_comm/> |
 | PMC OA license terms | <https://www.ncbi.nlm.nih.gov/pmc/tools/textmining/> |
 | NLM Terms of Service | <https://www.nlm.nih.gov/databases/download/terms_and_conditions.html> |
 
