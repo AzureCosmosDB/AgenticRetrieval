@@ -251,6 +251,7 @@ config.pubmed.yaml
 out/
 out/*.*
 data/skf_full.json
+/k[0-9]*_*/
 
 config.igmetall.yaml
 data/annotations.json
