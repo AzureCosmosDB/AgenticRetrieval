@@ -975,6 +975,7 @@ async def main_async():
     if (
         EMBED_API_FORMAT not in ("openai", "ollama")
         and not EMBED_ENDPOINT.rstrip("/").endswith("/api/embeddings")
+        and not EMBED_USE_RBAC
         and not EMBED_API_KEY
     ):
         print("❌ Error: Azure OpenAI API key not configured.")
