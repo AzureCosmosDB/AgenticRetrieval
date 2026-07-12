@@ -659,6 +659,22 @@ def create_database_and_container_via_management(credential, source_specs: List[
                 if "Conflict" in error_str or "already exists" in error_str.lower():
                     print(f"  ✓ Container '{container_name}' already exists - using as-is (no settings update)")
                     break
+                if "serverless" in error_str.lower() or "not supported for serverless" in error_str.lower():
+                    print("   Serverless account detected — retrying without throughput settings...")
+                    container_params_no_tp = SqlContainerCreateUpdateParameters(
+                        resource=container_resource, options=CreateUpdateOptions()
+                    )
+                    poller = mgmt_client.sql_resources.begin_create_update_sql_container(
+                        resource_group_name=resource_group,
+                        account_name=account_name,
+                        database_name=DATABASE_NAME,
+                        container_name=container_name,
+                        create_update_sql_container_parameters=container_params_no_tp
+                    )
+                    poller.result()
+                    print(f"  ✓ Container '{container_name}' created (serverless, no throughput)")
+                    break
+
                 if "capability has not been enabled" in error_str.lower() and attempt < max_retries - 1:
                     print(f"  ⏳ Waiting for capabilities to propagate (attempt {attempt + 1}/{max_retries})...")
                     time.sleep(retry_delay)

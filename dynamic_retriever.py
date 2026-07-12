@@ -48,7 +48,7 @@ class ServiceConnectionError(Exception):
 from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential, AzureCliCredential, get_bearer_token_provider
 from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential
 from dotenv import load_dotenv
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 from tqdm import tqdm
 import numpy as np
 
@@ -465,11 +465,20 @@ class LLMClient:
         return values
     
     @property
-    def llm_client(self) -> AsyncAzureOpenAI:
+    def llm_client(self):
         if not self._llm_client:
-            client_kwargs = {
-                "api_version": self._cfg["api_version"],
-                "azure_endpoint": self._cfg["llm_endpoint"],
+            endpoint = self._cfg["llm_endpoint"]
+            if endpoint.startswith("http://localhost") or endpoint.startswith("http://127.0.0.1"):
+                self._llm_client = AsyncOpenAI(
+                    base_url=endpoint,
+                    api_key=self._llm_api_key or "dummy",
+                    timeout=600.0,
+                    max_retries=0,
+                )
+            else:
+                client_kwargs = {
+                    "api_version": self._cfg["api_version"],
+                    "azure_endpoint": endpoint,
             }
             if self._use_rbac_auth:
                 client_kwargs["azure_ad_token_provider"] = self._token_provider
