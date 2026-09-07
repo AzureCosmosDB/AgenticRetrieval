@@ -71,19 +71,19 @@ pip install "git+https://github.com/AzureCosmosDB/AgenticRetrieval.git@main"
 
 Pin to a commit SHA or tag instead of a branch for reproducible installs.
 
-Only `dynamic_retriever.py` and `timing_summary.py` — plus their direct
-dependencies (`greedy_log_det.py`, `prompts.py`, `utils/fulltext.py`,
-`utils/ranker.py`) — are packaged for import as library code:
+The reusable entry points are `cosmos_db_upload.py`, `dynamic_retriever.py`,
+and `timing_summary.py`, plus their direct local dependencies
+(`greedy_log_det.py`, `prompts.py`, `utils/fulltext.py`, `utils/ranker.py`):
 
 ```python
+import cosmos_db_upload  # document ingestion, embedding, and Cosmos upsert
 from dynamic_retriever import ...  # decomposed/agentic RAG pipeline over Cosmos DB
 import timing_summary
 ```
 
-Everything else in the repo (`cosmos_db_upload.py`, sample configs, `tests/`,
-`docs/`, `data/`) is not part of the installable package. If you need
-ingestion (`cosmos_db_upload.py`) or the sample configs, clone the repo
-directly instead of installing it as a dependency.
+Sample configs, `tests/`, `docs/`, and `data/` are not part of the installable
+package. The upload and retrieval scripts still require a configured YAML file
+and access to the relevant Cosmos DB and model endpoints.
 
 ## Sequence of actions
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentic-retrieval"
 version = "0.1.0"
-description = "Cosmos DB-backed decomposed/agentic RAG retriever, packaged for reuse as a library (dynamic_retriever + timing_summary only)."
+description = "Cosmos DB-backed document uploader, decomposed/agentic RAG retriever, and timing tools."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -21,11 +21,10 @@ dependencies = [
     "numpy",
 ]
 
-# Only the two supported entry points and their direct local imports are
-# packaged. cosmos_db_upload.py, prompts sample files, tests, docs, and data
-# are intentionally excluded — clone the repo directly if you need those.
+# The supported reusable entry points and their direct local imports are
+# packaged. Sample files, tests, docs, and data remain excluded.
 [tool.setuptools]
-py-modules = ["dynamic_retriever", "timing_summary", "greedy_log_det", "prompts"]
+py-modules = ["cosmos_db_upload", "dynamic_retriever", "timing_summary", "greedy_log_det", "prompts"]
 
 [tool.setuptools.packages.find]
 include = ["utils", "utils.*"]
