@@ -59,6 +59,32 @@ Or use setup helpers:
 - PowerShell: `./run.ps1`
 - Bash: `source ./run.sh`
 
+## Using this project as a library
+
+This repository isn't published to PyPI, but it has minimal packaging metadata
+(`pyproject.toml`) so it can be installed straight from GitHub into another
+Python project via pip's Git support:
+
+```bash
+pip install "git+https://github.com/AzureCosmosDB/AgenticRetrieval.git@main"
+```
+
+Pin to a commit SHA or tag instead of a branch for reproducible installs.
+
+Only `dynamic_retriever.py` and `timing_summary.py` — plus their direct
+dependencies (`greedy_log_det.py`, `prompts.py`, `utils/fulltext.py`,
+`utils/ranker.py`) — are packaged for import as library code:
+
+```python
+from dynamic_retriever import ...  # decomposed/agentic RAG pipeline over Cosmos DB
+import timing_summary
+```
+
+Everything else in the repo (`cosmos_db_upload.py`, sample configs, `tests/`,
+`docs/`, `data/`) is not part of the installable package. If you need
+ingestion (`cosmos_db_upload.py`) or the sample configs, clone the repo
+directly instead of installing it as a dependency.
+
 ## Sequence of actions
 
 ### 1) Populate `config.yaml`

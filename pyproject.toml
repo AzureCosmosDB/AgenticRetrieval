@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-retrieval"
+version = "0.1.0"
+description = "Cosmos DB-backed decomposed/agentic RAG retriever, packaged for reuse as a library (dynamic_retriever + timing_summary only)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "azure-cosmos>=4.14",
+    "azure-identity>=1.25",
+    "httpx>=0.28",
+    "openai>=2.0",
+    "python-dotenv",
+    "PyYAML",
+    "tqdm",
+    "tiktoken",
+    "numpy",
+]
+
+# Only the two supported entry points and their direct local imports are
+# packaged. cosmos_db_upload.py, prompts sample files, tests, docs, and data
+# are intentionally excluded — clone the repo directly if you need those.
+[tool.setuptools]
+py-modules = ["dynamic_retriever", "timing_summary", "greedy_log_det", "prompts"]
+
+[tool.setuptools.packages.find]
+include = ["utils", "utils.*"]
