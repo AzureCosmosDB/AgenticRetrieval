@@ -168,8 +168,12 @@ def _ck(label: str, ref: float | None = None) -> float:
     if _TIMING:
         elapsed = now - (ref if ref is not None else _t0)
         total = now - _t0
+        if "– start" in label:
+            timing = f"(total {total:.3f}s)"
+        else:
+            timing = f"+{elapsed:.3f}s  (total {total:.3f}s)"
         _log_line(
-            _timing_text_with_question_prefix(f"  {_TIMING_MARK} {label}: +{elapsed:.3f}s  (total {total:.3f}s)"),
+            _timing_text_with_question_prefix(f"  {_TIMING_MARK} {label}: {timing}"),
             kind="timing",
             use_lock=True,
         )
@@ -1018,143 +1022,18 @@ class DecomposedRAGPipeline:
         fields = getattr(self.retriever, "configured_context_fields", []) or []
         return [str(f).strip() for f in fields if str(f).strip()]
 
-    def _inject_inline_context_fields_from_texts(self, answer: str, chunk_texts: list[str]) -> str:
-        configured_fields = self._configured_context_fields()
-        if not configured_fields or not answer.strip():
-            return answer
-
-        configured_lower = {f.lower() for f in configured_fields}
-        title_keys = {"product title", "product title translated", "title", "name"}
-        candidates: list[tuple[str, dict[str, str]]] = []
-
-        for chunk_text in chunk_texts:
-            if not isinstance(chunk_text, str) or not chunk_text.strip():
-                continue
-            title_value = ""
-            field_values: dict[str, str] = {}
-            for raw_line in chunk_text.splitlines():
-                line = raw_line.strip()
-                if not line or ":" not in line:
-                    continue
-                key, value = line.split(":", 1)
-                key_norm = key.strip().lower()
-                value_norm = value.strip()
-                if not value_norm:
-                    continue
-                if key_norm in title_keys and not title_value:
-                    title_value = value_norm
-                    continue
-                if key_norm in configured_lower:
-                    field_values[key_norm] = value_norm
-
-            if title_value and field_values:
-                candidates.append((title_value, field_values))
-
-        if not candidates:
-            return answer
-
-        # Prefer longer titles first to avoid partial replacements.
-        deduped: dict[str, dict[str, str]] = {}
-        for title, values in candidates:
-            deduped.setdefault(title, values)
-
-        updated = answer
-        for title in sorted(deduped.keys(), key=len, reverse=True):
-            values = deduped[title]
-            parts = []
-            for field in configured_fields:
-                value = values.get(field.lower())
-                if value:
-                    parts.append(f"{field}: **{value}**")
-            if not parts:
-                continue
-            inline = " (" + "; ".join(parts) + ")"
-            if title + inline in updated or f"**{title}**{inline}" in updated:
-                continue
-            bold_title = f"**{title}**"
-            if bold_title in updated:
-                updated = updated.replace(bold_title, bold_title + inline, 1)
-            else:
-                updated = updated.replace(title, title + inline, 1)
-
-        def _norm(text: str) -> str:
-            return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
-
-        def _tokens(text: str) -> set[str]:
-            return {t for t in _norm(text).split() if t}
-
-        # Fallback pass: rewrite bullet lines using fuzzy title matching.
-        title_field_map: dict[str, str] = {}
-        for title, values in deduped.items():
-            parts = []
-            for field in configured_fields:
-                value = values.get(field.lower())
-                if value:
-                    parts.append(f"{field}: **{value}**")
-            if parts:
-                title_field_map[title] = " (" + "; ".join(parts) + ")"
-
-        if title_field_map:
-            lines = updated.splitlines()
-            used_titles: set[str] = set()
-            for idx, line in enumerate(lines):
-                m = re.match(r"^(\s*-\s+\*\*)([^*]+)(\*\*.*)$", line)
-                if not m:
-                    continue
-                product_name = m.group(2).strip()
-                if not product_name or "product_id:" in line.lower():
-                    continue
-
-                product_tokens = _tokens(product_name)
-                if not product_tokens:
-                    continue
-
-                best_title = ""
-                best_score = 0.0
-                product_norm = _norm(product_name)
-                for title in title_field_map:
-                    if title in used_titles:
-                        continue
-                    title_norm = _norm(title)
-                    if not title_norm:
-                        continue
-                    if title_norm in product_norm or product_norm in title_norm:
-                        score = 1.0
-                    else:
-                        title_tokens = _tokens(title)
-                        if not title_tokens:
-                            continue
-                        overlap = len(product_tokens & title_tokens)
-                        score = overlap / max(1, len(product_tokens))
-                    if score > best_score:
-                        best_score = score
-                        best_title = title
-
-                if best_title and best_score >= 0.5:
-                    inline = title_field_map[best_title]
-                    suffix = m.group(3)
-                    if suffix.startswith("**"):
-                        lines[idx] = f"{m.group(1)}{product_name}**{inline}{suffix[2:]}"
-                    else:
-                        lines[idx] = f"{m.group(1)}{product_name}{inline}{suffix}"
-                    used_titles.add(best_title)
-
-            updated = "\n".join(lines)
-
-        return updated
-    
     def _format_context(self, chunks: list[RetrievedChunk]) -> str:
         chunks_text = "\n\n".join(f"[{i+1}] {c.text}" for i, c in enumerate(chunks))
         configured_fields = getattr(self.retriever, "configured_context_fields", []) or []
         if not configured_fields:
             return chunks_text
         fields_csv = ", ".join(configured_fields)
-        inline_example = "Product Name (" + "; ".join(f"{f}: **value**" for f in configured_fields) + ")"
+        inline_example = "Item (" + "; ".join(f"{f}: **value**" for f in configured_fields) + ")"
         preamble = (
             "Configured traceability fields: " + fields_csv + "\n"
-            "When mentioning a product by name, include these configured fields inline immediately after the name.\n"
+            "When mentioning an item, include these configured fields inline immediately after its label.\n"
             "Use format: " + inline_example + "\n"
-            "Do not include non-configured identifier fields (for example upc/document_id/sku) unless explicitly asked."
+            "Do not include non-configured traceability fields unless explicitly asked."
         )
         return preamble + "\n\n" + chunks_text
     
@@ -1250,13 +1129,6 @@ class DecomposedRAGPipeline:
         final = await self.llm.complete(SYNTHESIS_PROMPT.format(
             original_question=question, preliminary_answer=current, sub_qa_pairs=sub_pairs or "None"
         ), label="LLM synthesis")
-        chunk_texts = [c.text for c in initial_chunks]
-        for sub in all_subs:
-            for chunk in sub.retrieved_chunks:
-                content = chunk.get("content")
-                if isinstance(content, str):
-                    chunk_texts.append(content)
-        final = self._inject_inline_context_fields_from_texts(final, chunk_texts)
         _ck("pipeline: synthesis – done", t)
         
         _ck("pipeline.run – TOTAL", t_run)
@@ -1382,14 +1254,6 @@ class DecomposedRAGPipeline:
             ),
             label="LLM efficient synthesis",
         )
-        chunk_texts = [c.text for c in initial_chunks]
-        for rd in rounds_data:
-            for sub in rd.get("sub_questions", []):
-                for chunk in sub.get("chunks", []):
-                    content = chunk.get("content")
-                    if isinstance(content, str):
-                        chunk_texts.append(content)
-        final = self._inject_inline_context_fields_from_texts(final, chunk_texts)
         _ck("pipeline: efficient synthesis – done", t)
 
         _ck("pipeline.run_efficient – TOTAL", t_run)
@@ -1422,6 +1286,7 @@ _tool_use_source_cfg: dict = {}
 _tool_use_source_embed: dict = {}
 _tool_use_source_ft: dict = {}
 _tool_use_all_embed: set = set()
+_tool_use_context_fields: list[str] = []
 _tool_use_max_retries: int = 5
 _tool_use_rerank_mul: int = 1
 _tool_use_prune_k: int = 20
@@ -1436,6 +1301,33 @@ _tool_use_r_mr: int = 5
 _tool_use_query_template: str = ""
 
 _TIKTOKEN_ENC = tiktoken.get_encoding("o200k_base")
+
+
+def _build_tool_use_query_template(
+    template: str,
+    prune_k: int,
+) -> str:
+    return template.format(
+        prune_k=prune_k,
+        question="{question}",
+    )
+
+
+def _build_traceability_reminder(context_fields: list[str]) -> str:
+    fields = list(dict.fromkeys(
+        str(field).strip() for field in context_fields if str(field).strip()
+    ))
+    if not fields:
+        return ""
+    return (
+        "Before giving the final answer, preserve these configured context "
+        f"fields for every source item you mention: {', '.join(fields)}. "
+        "Copy each field/value pair exactly from that item's source document "
+        "and place it inline immediately after the item label. Do not attach "
+        "these fields to measurements, claims, categories, summaries, or "
+        "other descriptive text. Do not invent, infer, swap, or copy values "
+        "between source items."
+    )
 
 
 def count_tokens(msgs) -> int:
@@ -1698,6 +1590,7 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
     initial_msg = msgs[0]
     retries = 0
     non_prune_rounds = 0
+    traceability_reminder_added = False
     for iteration in range(50):
         try:
             t_step = _ck(f"LLM agent step – start (iter {iteration})")
@@ -1747,6 +1640,13 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
         m = r.choices[0].message
         msgs.append(m.model_dump(exclude_none=True))
         if not m.tool_calls:
+            if not traceability_reminder_added and _tool_use_context_fields:
+                msgs.append({
+                    "role": "user",
+                    "content": _build_traceability_reminder(_tool_use_context_fields),
+                })
+                traceability_reminder_added = True
+                continue
             answer = m.content or ""
             print(f"  Answer: {answer[:200]}...")
             elapsed = round(time.perf_counter() - t0, 2)
@@ -1759,6 +1659,20 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
             tc[t.function.name] = tc.get(t.function.name, 0) + 1
         call_names = [t.function.name for t in m.tool_calls]
         if "final_answer" in call_names:
+            if not traceability_reminder_added and _tool_use_context_fields:
+                for t in m.tool_calls:
+                    msgs.append({
+                        "role": "tool",
+                        "tool_call_id": t.id,
+                        "content": json.dumps({
+                            "status": "revise",
+                            "instruction": _build_traceability_reminder(
+                                _tool_use_context_fields
+                            ),
+                        }),
+                    })
+                traceability_reminder_added = True
+                continue
             if len(call_names) > 1:
                 print(f"  [warn] final_answer mixed with other calls; returning error for non-final_answer calls")
                 for t in m.tool_calls:
@@ -1897,7 +1811,7 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
             try:
                 a = json.loads(t.function.arguments)
                 vals = list(a.values())
-                print(f"  [{t.function.name}] {vals[0][:80] if vals and isinstance(vals[0], str) else '...'}")
+                print(f"  [{t.function.name}] {vals[0][:1024] if vals and isinstance(vals[0], str) else '...'}")
             except (json.JSONDecodeError, TypeError):
                 print(f"  [{t.function.name}] (malformed args)")
         non_prune_rounds += 1
@@ -1937,6 +1851,7 @@ def init_tool_use_clients() -> None:
     global _tool_use_llm, _tool_use_embed_client
     global _tool_use_llm_cfg, _tool_use_embed_cfg, _tool_use_cosmos_cfg
     global _tool_use_source_cfg, _tool_use_source_embed, _tool_use_source_ft, _tool_use_all_embed
+    global _tool_use_context_fields
     global _tool_use_max_retries, _tool_use_rerank_mul, _tool_use_prune_k
     global _tool_use_context_limit, _tool_use_use_hyde, _tool_use_use_ranker
     global _tool_use_r_http, _tool_use_r_url, _tool_use_r_tok, _tool_use_r_bs, _tool_use_r_mr
@@ -1951,6 +1866,12 @@ def init_tool_use_clients() -> None:
     _tool_use_source_embed = {s["id"]: s["embedding_field"] for s in sources}
     _tool_use_source_ft = {s["id"]: s["retrieval"]["fulltext_fields"] for s in sources}
     _tool_use_all_embed = set(_tool_use_source_embed.values())
+    _tool_use_context_fields = list(dict.fromkeys(
+        str(field).strip()
+        for source in sources
+        for field in source.get("context_fields", [])
+        if str(field).strip()
+    ))
     _tool_use_max_retries = int(_tool_use_llm_cfg["max_retries"])
     _tool_use_rerank_mul = int(cfg["ranker"].get("rerank_multiplier", 1))
     _tool_use_prune_k = int(cfg.get("prune_k", 20))
@@ -1994,7 +1915,10 @@ def init_tool_use_clients() -> None:
         _tool_use_r_http = httpx.AsyncClient(timeout=120)
 
     from prompts import DEFAULT_QUERY_TEMPLATE
-    _tool_use_query_template = DEFAULT_QUERY_TEMPLATE.replace("{prune_k}", str(_tool_use_prune_k))
+    _tool_use_query_template = _build_tool_use_query_template(
+        DEFAULT_QUERY_TEMPLATE,
+        _tool_use_prune_k,
+    )
 
 
 async def run_tool_use_mode(args) -> None:
@@ -2023,7 +1947,7 @@ async def run_tool_use_mode(args) -> None:
         out = out_root / "standard" / f"results_{time.strftime('%Y%m%d_%H%M%S')}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(results, indent=2))
-        print(f"\nSaved {len(results)} results to {out}")
+        _log_line(f"\nSaved {len(results)} results to {out}", kind="success")
         _ck(f"tool-use main – TOTAL ({len(results)} questions)", t_main)
     finally:
         await cosmos.close()
@@ -2115,7 +2039,7 @@ async def _run_tool_use_main(config_path: Path) -> None:
     _TIMING = args.timing
     _t0 = time.perf_counter()
     if _TIMING:
-        _log_line("Enabled: checkpoints printed as +<step_elapsed>s (total <from_start>s)", kind="timing")
+        _log_line("Enabled: starts show total time; completions show +<step_elapsed>s (total <from_start>s)", kind="timing")
 
     await run_tool_use_mode(args)
 
@@ -2180,7 +2104,7 @@ async def _run_decomposed_main(config_path: Path) -> None:
         kind="info"
     )
     if _TIMING:
-        _log_line("Enabled: checkpoints printed as +<step_elapsed>s (total <from_start>s)", kind="timing")
+        _log_line("Enabled: starts show total time; completions show +<step_elapsed>s (total <from_start>s)", kind="timing")
 
     t = _ck("retriever.initialize – start")
     await retriever.initialize()
@@ -2337,8 +2261,8 @@ if __name__ == "__main__":
                     sys.stderr = original_stderr
 
         shutil.copyfile(run_log_path, latest_log_path)
-        _log_line(f"wrote log: {run_log_path}", kind="timing")
-        _log_line(f"updated latest: {latest_log_path}", kind="timing")
+        _log_line(f"wrote log: {run_log_path}", kind="warn")
+        _log_line(f"updated latest: {latest_log_path}", kind="warn")
     else:
         try:
             asyncio.run(main_async())
