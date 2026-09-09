@@ -9,9 +9,9 @@ IMPORTANT RULES:
 4. If the context does not contain enough information to fully answer the question, clearly state what information IS available and what information IS MISSING
 5. Be precise and cite specific details from the context
 6. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible
-7. Only cite traceability fields that are explicitly configured and present in context chunks (for example product_id when configured via context_fields)
-8. Do NOT add other identifier fields (for example upc/document_id/sku) unless explicitly requested in the user question
-9. For listed products, place configured traceability fields inline immediately after the product name, for example: Product Name (product_id: **12345**)
+7. Only cite traceability fields that are explicitly configured and present in context chunks
+8. Do NOT add non-configured traceability fields unless explicitly requested in the user question
+9. For listed items, place configured traceability fields inline immediately after the item label
 
 Note: For traceability, user-configured fields (from context_fields) are included in each context chunk.
 
@@ -39,9 +39,9 @@ IMPORTANT RULES:
 4. If the context does not contain enough information to fully answer the question, clearly state what information IS available and what information IS MISSING
 5. Be precise and cite specific details from the context
 6. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible
-7. Only cite traceability fields that are explicitly configured and present in context chunks (for example product_id when configured via context_fields)
-8. Do NOT add other identifier fields (for example upc/document_id/sku) unless explicitly requested in the user question
-9. For listed products, place configured traceability fields inline immediately after the product name, for example: Product Name (product_id: **12345**)
+7. Only cite traceability fields that are explicitly configured and present in context chunks
+8. Do NOT add non-configured traceability fields unless explicitly requested in the user question
+9. For listed items, place configured traceability fields inline immediately after the item label
 
 Question: {question}
 
@@ -69,9 +69,9 @@ IMPORTANT RULES:
 6. Provide a COMPREHENSIVE and DETAILED answer - include all relevant information from the context
 7. Extract and include specific values, numbers, specifications, and technical details when available
 8. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible
-9. Only cite traceability fields that are explicitly configured and present in context chunks (for example product_id when configured via context_fields)
-10. Do NOT add other identifier fields (for example upc/document_id/sku) unless explicitly requested in the user question
-11. For listed products, place configured traceability fields inline immediately after the product name, for example: Product Name (product_id: **12345**)
+9. Only cite traceability fields that are explicitly configured and present in context chunks
+10. Do NOT add non-configured traceability fields unless explicitly requested in the user question
+11. For listed items, place configured traceability fields inline immediately after the item label
 
 Question: {question}
 
@@ -105,8 +105,8 @@ IMPORTANT RULES:
 4. If gaps still remain, clearly identify them
 5. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible
 6. Preserve and carry forward only configured traceability field/value pairs already present in the provided answers
-7. Do not introduce non-configured identifier fields (for example upc/document_id/sku) unless explicitly requested in the user question
-8. Keep configured traceability fields inline after product names when items are listed
+7. Do not introduce non-configured traceability fields unless explicitly requested in the user question
+8. Keep configured traceability fields inline after item labels when items are listed
 
 Original Question: {question}
 
@@ -170,7 +170,7 @@ Synthesize the information coherently, avoid repetition, and ensure the answer d
 Prioritize information from the sub-question answers that fill gaps in the preliminary answer.
 
 Preserve and include only configured traceability field/value pairs already present in the provided answers. Do not introduce non-configured identifier fields unless explicitly requested.
-When items are listed, keep configured traceability fields inline after the product name, for example: Product Name (product_id: **12345**).
+When items are listed, keep configured traceability fields inline after the item label.
 
 At the end, add a summary that directly answers the question in a concise way. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible
 
@@ -197,8 +197,8 @@ IMPORTANT RULES:
 4. If gaps still remain, clearly identify them
 5. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible
 6. Preserve and carry forward only configured traceability field/value pairs already present in the previous answer
-7. Do NOT add non-configured identifier fields (for example upc/document_id/sku) unless explicitly requested in the user question
-8. For listed products, place configured traceability fields inline immediately after the product name, for example: Product Name (product_id: **12345**)
+7. Do NOT add non-configured traceability fields unless explicitly requested in the user question
+8. For listed items, place configured traceability fields inline immediately after the item label
 
 Original Question: {question}
 
@@ -231,7 +231,7 @@ Answers from successive retrieval rounds (each round retrieved additional contex
 Based on the above information, provide an answer to the question in a concise way. Try to cover as many aspects, obtained numeric values and specific details in the answer as possible.
 
 Preserve and include only configured traceability field/value pairs already present in the provided answers. Do not introduce non-configured identifier fields unless explicitly requested.
-When items are listed, keep configured traceability fields inline after the product name, for example: Product Name (product_id: **12345**).
+When items are listed, keep configured traceability fields inline after the item label.
 
 Concise answer:"""
 
