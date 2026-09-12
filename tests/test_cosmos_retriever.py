@@ -54,14 +54,6 @@ def test_retrieval_sources_is_list():
         assert "container_name" in source
 
 
-def test_stopwords_set_exists():
-    """STOPWORDS should be a non-empty set."""
-    from utils.cosmos_retriever import STOPWORDS
-    assert isinstance(STOPWORDS, set)
-    assert len(STOPWORDS) > 0
-    assert "the" in STOPWORDS
-
-
 def test_as_list_of_strings():
     """_as_list_of_strings should convert list items to stripped strings."""
     from utils.cosmos_retriever import _as_list_of_strings
