@@ -55,8 +55,8 @@ def test_retrieval_sources_is_list():
 
 
 def test_stopwords_set_exists():
-    """STOPWORDS should be a non-empty set."""
-    from utils.cosmos_retriever import STOPWORDS
+    """STOPWORDS should be a non-empty set (used by utils.fulltext's query term filtering)."""
+    from utils.fulltext import STOPWORDS
     assert isinstance(STOPWORDS, set)
     assert len(STOPWORDS) > 0
     assert "the" in STOPWORDS

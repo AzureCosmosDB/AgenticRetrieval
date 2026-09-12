@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --ignore=tests/test_vector_consistency.py
+        # test_vector_consistency.py is a manual live-Cosmos DB diagnostic
+        # script (see its own module docstring), not a pytest suite — it
+        # parses --config from argv at import time and isn't meant to be
+        # collected here.
+        #
+        # Everything else in tests/ is a mocked unit test (httpx.MockTransport,
+        # patched credentials) and needs no live Azure/Cosmos DB access or
+        # secrets. This does not cover the credentialed integration checks
+        # issue #10 also asks for (real Cosmos DB + Azure OpenAI accounts via
+        # GitHub secrets, checking non-null search results and that
+        # rag_divdet.py produces real reasoning traces) — that needs
+        # maintainer-provisioned test infrastructure and is a separate,
+        # larger follow-up.
