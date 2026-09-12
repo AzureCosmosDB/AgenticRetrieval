@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -54,12 +55,22 @@ def _max_retries() -> int:
 
 
 def _build_retriever(k_ranker: int = 3) -> CombinedRetriever:
-    """Build a CombinedRetriever with ranker enabled and a mock token."""
-    retriever = CombinedRetriever(
-        retrieval_sources=RETRIEVAL_SOURCES,
-        k_diverse=0,
-        k_ranker=k_ranker,
-    )
+    """Build a CombinedRetriever with ranker enabled and a mock token.
+
+    CombinedRetriever.__init__ eagerly fetches a real AzureCliCredential token
+    when ranker.use_ranker is set (as it is in config.test.yaml.example),
+    which would otherwise require an interactively logged-in Azure CLI just to
+    construct the object under test. Patch the credential class so the
+    constructor gets a fake token instead of touching the real CLI.
+    """
+    fake_token = MagicMock(token="fake-token")
+    with patch("azure.identity.AzureCliCredential") as mock_credential_cls:
+        mock_credential_cls.return_value.get_token.return_value = fake_token
+        retriever = CombinedRetriever(
+            retrieval_sources=RETRIEVAL_SOURCES,
+            k_diverse=0,
+            k_ranker=k_ranker,
+        )
     retriever._use_ranker = True
     retriever._ranker_account = "test-account"
     retriever._ranker_region = "region"

@@ -23,15 +23,17 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest tests/ -v \
-            --ignore=tests/test_vector_consistency.py \
-            --ignore=tests/test_semantic_ranker.py
+          pytest tests/ -v --ignore=tests/test_vector_consistency.py
         # test_vector_consistency.py is a manual live-Cosmos DB diagnostic
         # script (see its own module docstring), not a pytest suite — it
         # parses --config from argv at import time and isn't meant to be
         # collected here.
         #
-        # test_semantic_ranker.py currently requires an interactively
-        # logged-in Azure CLI (AzureCliCredential) to even collect, so it
-        # can't run unattended in CI yet. Tracked as a follow-up rather than
-        # bundled into this workflow.
+        # Everything else in tests/ is a mocked unit test (httpx.MockTransport,
+        # patched credentials) and needs no live Azure/Cosmos DB access or
+        # secrets. This does not cover the credentialed integration checks
+        # issue #10 also asks for (real Cosmos DB + Azure OpenAI accounts via
+        # GitHub secrets, checking non-null search results and that
+        # rag_divdet.py produces real reasoning traces) — that needs
+        # maintainer-provisioned test infrastructure and is a separate,
+        # larger follow-up.
