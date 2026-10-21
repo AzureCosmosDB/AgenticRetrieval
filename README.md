@@ -4,7 +4,7 @@
 
 Agentic Retrieval is a multi-stage agentic retrieval accelerator for answering complex questions that typically require multi-hop reasoning. It is a self-correcting RAG system that iteratively identifies knowledge gaps, retrieves targeted evidence, and generates more complete answers — built on Azure Cosmos DB for NoSQL and Microsoft Foundry.
 
-Instead of relying on a single search-and-answer pass, the pipeline interleaves retrieval and reasoning across multiple rounds: it drafts a preliminary answer, analyzes what is still missing or under-supported, decomposes the gap into focused sub-questions, retrieves new evidence per sub-question across one or more Cosmos DB containers, and finally synthesizes a grounded answer from the accumulated context.
+Instead of relying on a single search-and-answer pass, the pipeline interleaves retrieval and reasoning across multiple rounds. Tool-use mode lets the LLM choose searches within an enforced research budget. Decomposed mode drafts a preliminary answer, identifies gaps, generates focused sub-questions, and retrieves and synthesizes evidence over a configured number of refinement cycles.
 
 ## Useful for scenarios with…
 
@@ -23,9 +23,9 @@ Agentic Retrieval has two stages:
    - Upserts documents into Azure Cosmos DB containers with vector and full-text indexing enabled.
 
 2. **Retrieval and answering (`dynamic_retriever.py`)**
-   - Runs a decomposed RAG loop combining vector search, full-text search, diversity selection, and optional semantic reranking across all configured sources.
-   - Iteratively generates sub-questions to fill knowledge gaps, retrieves targeted evidence for each, and synthesizes a final answer.
-   - Writes per-question traces and grouped answer files under `out/`.
+   - Supports bounded **tool-use** (the default) and structured **decomposed** retrieval across all configured sources.
+   - Combines vector and full-text search with optional semantic reranking; decomposed mode additionally supports diversity selection and explicit sub-question refinement.
+   - Checkpoints tool-use results or writes decomposed per-question traces and grouped answer files under `out/`.
 
 > **Note:** This package can optionally use the **Azure Cosmos DB Semantic Reranker**
 > to reorder retrieved results by semantic relevance before answer synthesis. It is
@@ -143,8 +143,156 @@ python cosmos_db_upload.py --config config.yaml
 Notes:
 
 - Upload target(s) are inferred from configured `cosmos.sources` entries with non-empty `documents_root`.
+- Use `--source <id>` to upload just one configured source; unknown IDs fail before connecting.
+- Newline-delimited JSON inputs support `.jsonl`, `.ndjson`, and `.jsonlines` extensions
+  (case-insensitive), both as individual source files and within source directories.
+- For the two product files configured in `config.products.yaml`, run
+  `.\upload-products.ps1` in PowerShell. It uploads each source separately, uses the
+  repository's `.venv` Python when available (otherwise `python`), and stops on a
+  nonzero command exit code. Existing containers' indexing policies are not updated.
+- Embedding batches retry HTTP 408/409/429/5xx responses and connection errors
+  (including SDK timeouts) with exponential backoff. Lower `cosmos.concurrent_batches` and
+  `cosmos.embedding_batch_size` if requests frequently time out.
+- Reruns skip documents by their generated ID and configured source partition key.
+  Keep input filenames and JSONL record ordering unchanged when resuming; those
+  determine generated IDs. Existing documents are skipped, not refreshed.
+- For directory JSONL/NDJSON inputs, IDs include the source-root-relative path
+  (with normalized `/` separators) and line number, so same-named files in
+  different subdirectories remain distinct. Single-file input IDs are unchanged.
+  Resuming a directory upload created with older basename-only IDs requires
+  migration or a clean target; nested-file IDs now differ.
+- Existence checks support undefined partition keys as well as explicit JSON
+  null; an absent nested parent is treated as undefined, not an upload error.
+- After reporting the upload summary and closing clients, the uploader exits
+  with a nonzero code if any documents failed.
+- Tenant-scoped Cosmos authentication allows 60 seconds for each Azure CLI token
+  request. Temporary CLI process timeouts are retried during existence checks and
+  writes; persistent authentication failures are raised rather than treated as
+  missing documents. If CLI failures persist, verify `az account show` and
+  `az login --tenant <tenant-id>` in the same terminal before resuming.
 
 ### 3) Run retrieval and generate answers
+
+Both retrieval modes use an expiry-aware Entra token provider for semantic
+reranking, refreshing tokens during long runs. HTTP 401/403 responses are reported
+without repeatedly retrying the same unauthorized request. By default, ranker
+failures keep the unranked/diversity-selected fallback; consult the run log when
+assessing answer quality. Set `ranker.fail_on_error: true` to fail visibly instead:
+the ranker token is acquired at startup (a failure aborts the run with a clear
+message), and any later ranker failure aborts the run rather than silently
+returning unranked results. With the default `false`, a startup token failure is
+only logged. A fatal runtime ranker failure in decomposed mode cancels remaining
+questions, closes clients and exits nonzero; completed per-question traces remain
+under the run's `intermediate/` directory.
+
+Both retrieval modes project document IDs and each source's partition key during
+vector and full-text candidate searches (plus vector distance for vector
+candidates). At startup the partition key path is read from the container
+definition (`partitionKey.paths`) for every source that is searched. The
+configured `partition_key_path` is used only if the container definition cannot
+be read, and a mismatch is logged. A missing or invalid path, a container
+without a partition key, or a hierarchical partition key stops the run with a
+clear error. Full-text field lists are fused with the same
+client-side RRF as before. Candidates are then merged by container, partition
+key and document ID, and full documents are fetched once per unique candidate
+using partition-aware point reads with at most 16 concurrent reads per search.
+Container identity includes the account, database and container, so source aliases
+that use separate SDK proxies for the same container still share a candidate.
+Ranking, formatting and diversity selection run on those full documents,
+including their existing embeddings. Timing logs report this post-merge stage
+as `fetch candidates`. A point read that fails with HTTP 404 (for example a
+document deleted since the query) or 429 is logged and that candidate is
+skipped; other point-read errors still propagate.
+The QA CLI vector baseline also resolves partition paths and fetches full
+documents after candidate merging before constructing answer context.
+
+Configured `fulltext_fields` that are not dotted identifiers (with an optional
+trailing `[]`) are skipped with a warning at startup in both modes. In decomposed
+mode, full-text index paths read from the container policy are validated once,
+unsupported ones are skipped with a warning, and the result is cached.
+
+For string-array full-text fields, configure a terminal `[]` in
+`retrieval.fulltext_fields` (for example `derived_attributes[]`) and the matching
+`/derived_attributes/[]` path in both `fullTextIndexes` and `fullTextPaths`.
+Both retrieval modes use an `EXISTS` subquery with `FullTextContainsAny` on each
+array element, returning each matching document once. Scalar fields retain BM25
+ranking. Array candidates are limited by `fulltext_search_k` without BM25 ordering;
+their order in multi-field fusion is not a relevance score. Broad array queries
+can therefore omit relevant documents beyond that limit. Arrays and embeddings
+are unchanged. Live query diagnostics may report the array path as a potential
+index rather than an utilized index; do not assume these predicates are
+index-accelerated without checking diagnostics for the deployed service.
+
+Tool-use mode atomically checkpoints full answers and per-question
+`elapsed_seconds` to its results JSON after every completed question, preserving
+completed work if a later question fails or the process is stopped.
+
+#### Choose a mode and understand its limits
+
+The CLI `--mode` overrides `pipeline.mode`; if neither is set, the default is
+`tool-use`. The modes do **not** share a round limit:
+
+| Setting | Applies to | Meaning |
+| --- | --- | --- |
+| `pipeline.max_search_rounds` | Tool-use only | Follow-up search turns after the one initial search; parallel queries count as one turn. Default: 4; minimum: 0. |
+| `pipeline.max_agent_turns` | Tool-use only | Safety cap on research/control turns, including pruning, invalid calls and retries. Default: 50; minimum: 1. |
+| `pipeline.rounds` / `--rounds` | Decomposed only | Gap-analysis, sub-question retrieval and answer-refinement cycles after initial retrieval and a preliminary answer. Default: 2. |
+
+For example:
+
+```yaml
+pipeline:
+  mode: tool-use
+  max_search_rounds: 4
+  max_agent_turns: 50
+  rounds: 2                # Used only when mode is decomposed
+```
+
+```bash
+# Bounded agent-driven research; uses max_search_rounds and max_agent_turns
+python dynamic_retriever.py --config config.yaml --mode tool-use --timing
+
+# Initial retrieval/preliminary answer, then two structured refinement cycles
+python dynamic_retriever.py --config config.yaml --mode decomposed --rounds 2 --timing
+```
+
+These commands use `paths.questions_path` and `paths.output_root`; override
+them with `--questions-path` and `--output-root` as needed.
+
+`initial_search` executes at most once per question. `max_search_rounds` counts
+follow-up turns that request searches (parallel queries count as one turn);
+zero allows only initial retrieval before final synthesis. `max_agent_turns`
+is a separate safety cap covering research, pruning, invalid calls and retries.
+Both limits must be integers; search rounds may be zero and agent turns must
+be positive. Defaults are 4 and 50.
+
+Explicit pruning, automatic pruning and context-overflow recovery retain an
+independent progress ledger: completed initial retrieval, attempted queries,
+source-backed finding excerpts, assistant notes and the latest gap analysis.
+Notes and gaps are provisional, not additional source evidence. Compacted
+context includes this progress plus retained documents, rather than restarting
+the workflow. When context is too small for all finding excerpts, omissions
+are logged; the complete ledger remains in the saved result. Full retrieved
+documents remain cached for explicit pruning during the question.
+
+At either limit the runtime disables research tools and requires `final_answer`,
+with instructions to identify unmet requirements and unverified facts. Final
+synthesis has at most `llm.max_retries` attempts (at least one), separate from
+the research-turn cap. Empty or malformed answers are not accepted as success.
+Tool-use results include `status`, `termination_reason` and `research_progress`:
+
+| Status | Meaning |
+| --- | --- |
+| `completed` | A nonempty answer was produced, either normally or through forced synthesis. `research_budget_exhausted` identifies planned budget-based finalization; it does not mean every requirement was verified. |
+| `partial` | The agent-turn safety cap was reached and forced synthesis produced an answer (`termination_reason: agent_turn_limit`). |
+| `failed` | No valid answer could be produced, for example `finalization_failed` or `llm_error`. The record includes an explicit `error`; an empty answer is never marked successful. |
+
+Failed records are checkpointed and processing continues to the remaining
+questions; the CLI exits nonzero after saving the run if any records failed.
+Partial answers are explicitly marked but do not alone cause a nonzero exit.
+The `rounds` result field counts agent and final-synthesis LLM attempts, not
+decomposed refinement cycles. No limit can guarantee that every user requirement
+is supported by the available corpus.
 
 Before running retrieval, prepare your questions file.
 
@@ -172,7 +320,9 @@ Then run:
 python dynamic_retriever.py --config config.yaml --questions-path path/to/questions.json
 ```
 
-Both `--config` and `--questions-path` are required. `--config` specifies the YAML configuration file; `--questions-path` points to a single `.json` file containing the question array.
+`--config` is required. `--questions-path` optionally overrides
+`paths.questions_path` and points to a single `.json` file containing the
+question array.
 
 The paradigm is selected by `--mode {tool-use,decomposed}` (CLI flag) or `pipeline.mode` in YAML; the CLI overrides the config. The default when neither is set is `tool-use`.
 
@@ -202,8 +352,9 @@ What this script does:
 
 Outputs are written to:
 
-- `out/k.../intermediate/...` (per-question intermediate traces)
-- `out/k.../questions_with_answers.json` (final grouped answers)
+- `out/k.../intermediate/...` (decomposed per-question traces)
+- `out/k.../<questions-stem>_<timestamp>.json` (decomposed grouped answers)
+- `out/standard/results_<timestamp>.json` (tool-use answer/status/progress checkpoints)
 
 ## Useful runtime overrides
 
@@ -213,11 +364,15 @@ These flags override the corresponding `config.yaml` values for a single run (de
 - `--eta` — Gram-matrix regularization strength used by the diversity selection.
 - `--rescale-power` — exponent applied to query-similarity scores when rescaling before diversity selection.
 - `--max-sub-questions` — maximum number of gap-filling sub-questions generated per round.
-- `--rounds` — number of decompose/retrieve/synthesize rounds to run.
-- `--max-questions` — only answer the first N questions from the questions file (handy for smoke tests).
+- `--rounds` — decomposed refinement cycles only; does not limit tool-use turns or searches.
+- `--max-questions` — only answer the first N questions from the questions file (both modes; handy for smoke tests).
 - `--max-workers` — number of questions processed concurrently.
-- `--questions-path` — path to the questions `.json` file (overrides `paths.questions_path`).
-- `--output-root` — directory where traces and answer files are written (overrides `paths.output_root`).
+- `--questions-path` — path to the questions `.json` file (both modes; overrides `paths.questions_path`).
+- `--output-root` — directory where traces and answer files are written (both modes; overrides `paths.output_root`).
+
+Tool-use search/turn budgets are YAML settings, not CLI flags. `--timing` is
+available in both modes. Tool-use gap analysis is an optional tool the agent
+may call; it is not the mandatory gap/sub-question stage of decomposed mode.
 
 ### `--timing` — wall-clock profiling
 
@@ -238,7 +393,7 @@ Immediately before each Cosmos DB call, the actual query is also printed as a `[
 ## Repository layout
 
 - `cosmos_db_upload.py` — ingestion + embedding + Cosmos upsert
-- `dynamic_retriever.py` — decomposed RAG retrieval/answer pipeline
+- `dynamic_retriever.py` — bounded tool-use and decomposed RAG retrieval/answer pipelines
 - `timing_summary.py` — timed rerun + timing comparison table generation
 - `config.yaml.example` — sample data config template for files under `data/`
 - `data/` — sample input corpus

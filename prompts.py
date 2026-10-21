@@ -250,7 +250,10 @@ Workflow:
 3. Use prune() if context grows too large.
 4. When you have enough information, call final_answer(answer) with your complete answer.
 
-Do one to four rounds of search after initial_search. Then call final_answer.
+The runtime supplies a follow-up search-round budget. Once initial_search has run,
+never call it again, including after pruning. Use targeted searches only for
+unresolved gaps. At the budget limit, call final_answer using the evidence found
+and explicitly state unmet requirements and unverified facts.
 
 Question: {question}
 

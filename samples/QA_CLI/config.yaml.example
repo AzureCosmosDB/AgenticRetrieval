@@ -28,11 +28,16 @@ hyde: false
 # offered directly).
 pipeline:
   mode: tool-use            # {tool-use, decomposed}
+  # [tool-use only] initial_search executes once; pruning retains research progress.
+  max_search_rounds: 4      # Integer >= 0; parallel follow-up queries count as one search turn
+  max_agent_turns: 50       # Integer >= 1; research/control turns, excluding final synthesis
+  # Either limit forces final_answer; max(1, llm.max_retries) final-synthesis attempts.
+  # QA_CLI labels agent-limit rescue answers partial and displays failed finalization as an error.
   # [decomposed only]
   max_sub_questions: 5
   subq_fanout_cap: 3
   subq_max_concurrency: 2
-  rounds: 2
+  rounds: 2                # Structured refinement cycles; ignored by the tool-use strategy
   preliminary_prefix: ""
   subquery_prefix: ""
   dataset_description: ""
@@ -88,6 +93,7 @@ ranker:
   token_scope: ""
   batch_size: 16
   max_retries: 5
+  fail_on_error: false      # true: surface ranker failures instead of using unranked results
 
 # Cosmos DB settings.
 cosmos:

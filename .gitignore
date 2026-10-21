@@ -264,3 +264,8 @@ utils/create_inference_service.my.py
 utils/test_semantic_reranker.my.py
 
 Standard/
+config.products.yaml
+upload-products.ps1
+data/products.json
+data/products/products_derived_attributes.ndjson
+data/products/products_on_pack.ndjson

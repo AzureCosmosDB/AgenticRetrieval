@@ -5,8 +5,8 @@ This script:
 1. Automatically ensures missing Cosmos DB containers for enabled upload targets when
     management settings are available; otherwise skips missing targets.
 2. Determines upload targets from `cosmos.sources` in config, using each source's
-    `documents_root` (folder or JSONL file path).
-3. Scans all files in each enabled folder (content is assumed JSON) or reads JSONL files,
+    `documents_root` (folder or .jsonl/.ndjson/.jsonlines file path).
+3. Scans all files in each enabled folder (content is assumed JSON) or reads newline-delimited JSON files,
     parses documents, and generates embeddings from the configured embedding endpoint/model.
 4. Uploads documents to the matching container and stores vectors in the configured embedding field.
 """
@@ -26,7 +26,7 @@ import httpx
 from azure.cosmos.aio import CosmosClient
 from azure.cosmos import exceptions
 from azure.core.exceptions import HttpResponseError
-from azure.identity import DefaultAzureCredential as SyncDefaultAzureCredential
+from azure.identity import CredentialUnavailableError, DefaultAzureCredential as SyncDefaultAzureCredential
 from azure.identity.aio import AzureCliCredential as AsyncAzureCliCredential, DefaultAzureCredential as AsyncDefaultAzureCredential
 from azure.mgmt.cosmosdb import CosmosDBManagementClient
 from azure.mgmt.cosmosdb.models import (
@@ -48,10 +48,11 @@ from azure.mgmt.cosmosdb.models import (
     FullTextPath,
     FullTextIndexPath,
 )
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, AsyncAzureOpenAI, AsyncOpenAI
 from tqdm import tqdm
 import yaml
 from pathlib import Path
+from utils.candidates import extract_partition_key
 
 LOCAL_EMBED_WORKERS = 8
 UPLOAD_WORKERS = 8
@@ -389,7 +390,7 @@ def get_cosmos_client(use_rbac_auth: bool, credential=None) -> CosmosClient:
         # when tenant_id is configured so the token is issued by the expected tenant.
         if credential is None:
             credential = (
-                AsyncAzureCliCredential(tenant_id=tenant_id)
+                AsyncAzureCliCredential(tenant_id=tenant_id, process_timeout=60)
                 if tenant_id
                 else AsyncDefaultAzureCredential()
             )
@@ -787,7 +788,14 @@ def replace_document_id(doc: Dict[str, Any], relative_path: str) -> Dict[str, An
     return doc
 
 
-def _load_jsonl_documents(jsonl_path: str) -> list[dict[str, Any]]:
+def _is_jsonl_file(file_path: str) -> bool:
+    path = Path(file_path)
+    return path.suffix.lower() in (".jsonl", ".ndjson", ".jsonlines") and path.is_file()
+
+
+def _load_jsonl_documents(
+    jsonl_path: str, *, source_relative_path: str | None = None,
+) -> list[dict[str, Any]]:
     """Load documents from a JSONL file, adding _source_line and deterministic id."""
     documents: list[dict[str, Any]] = []
     with open(jsonl_path, 'r', encoding='utf-8') as f:
@@ -803,7 +811,11 @@ def _load_jsonl_documents(jsonl_path: str) -> list[dict[str, Any]]:
             if not isinstance(record, dict):
                 continue
             record['_source_line'] = line_num
-            source_key = f"{os.path.basename(jsonl_path)}:{line_num}"
+            source_file = (
+                source_relative_path.replace("\\", "/")
+                if source_relative_path is not None else os.path.basename(jsonl_path)
+            )
+            source_key = f"{source_file}:{line_num}"
             record = replace_document_id(record, source_key)
             documents.append(record)
     return documents
@@ -831,6 +843,14 @@ async def upload_document(container, doc: Dict[str, Any], max_retries: int = 5) 
                 continue
             print(f"Error uploading document {doc_id} (transient after {max_retries} retries): {e}")
             return False
+        except CredentialUnavailableError as e:
+            if "Timed out waiting for Azure CLI" in str(e) and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"Azure CLI token request timed out for {doc_id}; retrying upload in {wait}s.")
+                await asyncio.sleep(wait)
+                continue
+            print(f"Error authenticating upload for document {doc_id}: {e}")
+            raise
         except Exception as e:
             err_name = type(e).__name__
             if ("Incomplete" in err_name or "Payload" in err_name or "Transfer" in err_name
@@ -859,21 +879,30 @@ async def upload_documents_batch(container, docs: List[Dict[str, Any]]) -> tuple
     return success_count, len(results) - success_count
 
 
-async def _doc_exists(container, doc_id: str) -> bool:
+async def _doc_exists(container, doc: dict, partition_key_path: str = "/id") -> bool:
     """Check if a document already exists via point-read (cheap, 1 RU)."""
-    try:
-        await container.read_item(item=doc_id, partition_key=doc_id)
-        return True
-    except exceptions.CosmosResourceNotFoundError:
-        return False
-    except Exception:
-        return False
+    doc_id = doc["id"]
+    partition_key = extract_partition_key(doc, partition_key_path)
+    for attempt in range(5):
+        try:
+            await container.read_item(item=doc_id, partition_key=partition_key)
+            return True
+        except exceptions.CosmosResourceNotFoundError:
+            return False
+        except CredentialUnavailableError as e:
+            if "Timed out waiting for Azure CLI" not in str(e) or attempt == 4:
+                raise
+            wait = 2 ** attempt
+            print(f"Azure CLI token request timed out checking {doc_id}; retrying in {wait}s.")
+            await asyncio.sleep(wait)
 
 
-async def _filter_existing_docs(container, batch_docs: list[dict]) -> list[dict]:
+async def _filter_existing_docs(
+    container, batch_docs: list[dict], partition_key_path: str = "/id"
+) -> list[dict]:
     """Return only docs whose IDs don't already exist in the container."""
     checks = await asyncio.gather(
-        *(_doc_exists(container, doc.get("id", "")) for doc in batch_docs)
+        *(_doc_exists(container, doc, partition_key_path) for doc in batch_docs)
     )
     return [doc for doc, exists in zip(batch_docs, checks) if not exists]
 
@@ -886,12 +915,13 @@ async def _embed_and_upload_batch(
     text_fields: list[str],
     max_embed_retries: int = 5,
     skip_existing: bool = True,
+    partition_key_path: str = "/id",
 ) -> tuple[int, int, float, float]:
-    """Embed + upload a single batch with retry for rate-limit errors."""
+    """Embed + upload a single batch with retry for rate limits and connection errors."""
     embed_secs = upload_secs = 0.0
 
     if skip_existing:
-        batch_docs = await _filter_existing_docs(container, batch_docs)
+        batch_docs = await _filter_existing_docs(container, batch_docs, partition_key_path)
         if not batch_docs:
             return 0, 0, 0.0, 0.0
 
@@ -906,17 +936,31 @@ async def _embed_and_upload_batch(
             break
         except Exception as e:
             embed_secs += time.perf_counter() - t0
-            err_str = str(e)
             err_name = type(e).__name__
-            is_rate_limit = "429" in err_str or "RateLimitReached" in err_str or "rate" in err_str.lower()
+            status_code = (
+                e.status_code if isinstance(e, APIStatusError)
+                else e.response.status_code if isinstance(e, httpx.HTTPStatusError)
+                else None
+            )
+            is_retryable_status = status_code in (408, 409, 429) or (
+                status_code is not None and status_code >= 500
+            )
             is_transient = ("Incomplete" in err_name or "Payload" in err_name
                             or "Transfer" in err_name or "ServiceRequest" in err_name
-                            or isinstance(e, (ConnectionError, TimeoutError, OSError)))
-            if (is_rate_limit or is_transient) and attempt < max_embed_retries - 1:
+                            or isinstance(e, (APIConnectionError, httpx.TransportError,
+                                              ConnectionError, TimeoutError, OSError)))
+            if (is_retryable_status or is_transient) and attempt < max_embed_retries - 1:
                 wait = 2 * (2 ** attempt)
+                print(
+                    f"\nEmbedding batch attempt {attempt + 1}/{max_embed_retries} "
+                    f"failed ({err_name}: {e}); retrying in {wait}s."
+                )
                 await asyncio.sleep(wait)
                 continue
-            print(f"\nError embedding batch: {e}")
+            print(
+                f"\nError embedding batch after {attempt + 1} attempt(s) "
+                f"({len(batch_docs)} documents, {err_name}): {e}"
+            )
             return 0, len(batch_docs), embed_secs, upload_secs
 
     if embeddings is None:
@@ -938,10 +982,19 @@ async def main_async():
         default=None,
         help="Path to config YAML file (default: config.yaml in script directory)",
     )
+    parser.add_argument(
+        "--source",
+        help="Upload only the cosmos.sources entry with this id (default: all configured sources)",
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config) if args.config else Path(__file__).parent / "config.yaml"
     load_config(config_path)
+    source_configs = SOURCE_CONFIGS
+    if args.source is not None:
+        source_configs = [source for source in SOURCE_CONFIGS if source["id"] == args.source]
+        if not source_configs:
+            parser.error(f"Unknown source id: {args.source!r}")
 
     print("=" * 60)
     print("Cosmos DB Document Upload with OpenAI Embeddings")
@@ -987,7 +1040,7 @@ async def main_async():
     print(f"✓ Embedding dimensions: {EMBEDDING_DIMENSIONS}")
 
     upload_targets = []
-    for source in SOURCE_CONFIGS:
+    for source in source_configs:
         source_name = source.get("id", "unknown")
         container_name = source.get("container_name")
         partition_key_path = source.get("partition_key_path")
@@ -1047,7 +1100,7 @@ async def main_async():
     data_plane_credential = None
     if use_rbac_auth:
         data_plane_credential = (
-            AsyncAzureCliCredential(tenant_id=tenant_id)
+            AsyncAzureCliCredential(tenant_id=tenant_id, process_timeout=60)
             if tenant_id
             else AsyncDefaultAzureCredential()
         )
@@ -1102,7 +1155,7 @@ async def main_async():
         text_fields = target["embedding_text_fields"]
 
         # Load documents from source
-        is_jsonl = documents_root.endswith('.jsonl') and os.path.isfile(documents_root)
+        is_jsonl = _is_jsonl_file(documents_root)
         parser_spec = target.get("document_parser")
         file_glob_pattern = target.get("file_glob")
         document_parser_fn = _load_document_parser(parser_spec) if parser_spec else None
@@ -1172,6 +1225,7 @@ async def main_async():
                     task = asyncio.create_task(
                         _embed_and_upload_batch(
                             batch, embed_client, container, embedding_field, text_fields,
+                            partition_key_path=target["partition_key_path"],
                         )
                     )
                     def _on_done(t: asyncio.Task) -> None:
@@ -1237,8 +1291,10 @@ async def main_async():
                 for file_path in tqdm(input_files, desc=f"Loading {target_name} files"):
                     parse_start = time.perf_counter()
                     relative_path = os.path.relpath(file_path, documents_root)
-                    if file_path.lower().endswith('.jsonl'):
-                        jsonl_docs = await asyncio.to_thread(_load_jsonl_documents, file_path)
+                    if _is_jsonl_file(file_path):
+                        jsonl_docs = await asyncio.to_thread(
+                            _load_jsonl_documents, file_path, source_relative_path=relative_path,
+                        )
                         for jdoc in jsonl_docs:
                             jdoc['_source_file'] = relative_path
                         all_docs.extend(jsonl_docs)
@@ -1271,6 +1327,7 @@ async def main_async():
             async with batch_sem:
                 return await _embed_and_upload_batch(
                     batch, embed_client, container, embedding_field, text_fields,
+                    partition_key_path=target["partition_key_path"],
                 )
 
         for i in range(0, len(all_docs), batch_size):
@@ -1319,6 +1376,9 @@ async def main_async():
         await data_plane_credential.close()
     if _embed_credential is not None:
         _embed_credential.close()
+
+    if failed_uploads:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
