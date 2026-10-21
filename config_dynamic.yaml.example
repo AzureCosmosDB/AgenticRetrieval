@@ -6,6 +6,16 @@ paths:
 prune_k: 20
 hyde: false
 
+# Tool-use research budget. For the unified/decomposed template see config.yaml.example.
+pipeline:
+  mode: tool-use          # CLI --mode overrides this; pipeline.rounds does not limit tool-use
+  # initial_search executes once, and pruning retains research progress.
+  max_search_rounds: 4     # Integer >= 0; follow-up search turns, parallel queries count as one
+  max_agent_turns: 50      # Integer >= 1; research/control-turn cap, not final-synthesis attempts
+  # Either limit forces final_answer with explicit unmet requirements and unverified facts.
+  # Final synthesis uses at most max(1, llm.max_retries) attempts.
+  # Empty/malformed finalization is failed, not completed; failed records cause nonzero CLI exit.
+
 # Azure OpenAI / LLM settings
 llm:
   llm_endpoint: ""
@@ -47,6 +57,7 @@ ranker:
   token_scope: ""
   batch_size: 16
   max_retries: 5
+  fail_on_error: false      # true: abort at startup/run if the ranker is unusable instead of falling back to unranked results
 
 # Cosmos DB settings
 cosmos:

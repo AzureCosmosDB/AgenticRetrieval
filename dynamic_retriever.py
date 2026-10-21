@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Callable
 import copy
 import contextvars
 import datetime
@@ -53,8 +54,14 @@ from tqdm import tqdm
 import numpy as np
 
 from greedy_log_det import greedy_log_det_select
-from utils.fulltext import fulltext_search
-from utils.ranker import rerank_documents
+from utils.fulltext import fulltext_search, is_fulltext_field_path
+from utils.candidates import (
+    ConfigurationError,
+    candidate_projection,
+    fetch_candidate_documents,
+    resolve_partition_key_path,
+)
+from utils.ranker import RankerUnavailableError, rerank_documents, verify_ranker_token
 
 load_dotenv()
 
@@ -168,8 +175,12 @@ def _ck(label: str, ref: float | None = None) -> float:
     if _TIMING:
         elapsed = now - (ref if ref is not None else _t0)
         total = now - _t0
+        if "– start" in label:
+            timing = f"(total {total:.3f}s)"
+        else:
+            timing = f"+{elapsed:.3f}s  (total {total:.3f}s)"
         _log_line(
-            _timing_text_with_question_prefix(f"  {_TIMING_MARK} {label}: +{elapsed:.3f}s  (total {total:.3f}s)"),
+            _timing_text_with_question_prefix(f"  {_TIMING_MARK} {label}: {timing}"),
             kind="timing",
             use_lock=True,
         )
@@ -1027,143 +1038,18 @@ class DecomposedRAGPipeline:
         fields = getattr(self.retriever, "configured_context_fields", []) or []
         return [str(f).strip() for f in fields if str(f).strip()]
 
-    def _inject_inline_context_fields_from_texts(self, answer: str, chunk_texts: list[str]) -> str:
-        configured_fields = self._configured_context_fields()
-        if not configured_fields or not answer.strip():
-            return answer
-
-        configured_lower = {f.lower() for f in configured_fields}
-        title_keys = {"product title", "product title translated", "title", "name"}
-        candidates: list[tuple[str, dict[str, str]]] = []
-
-        for chunk_text in chunk_texts:
-            if not isinstance(chunk_text, str) or not chunk_text.strip():
-                continue
-            title_value = ""
-            field_values: dict[str, str] = {}
-            for raw_line in chunk_text.splitlines():
-                line = raw_line.strip()
-                if not line or ":" not in line:
-                    continue
-                key, value = line.split(":", 1)
-                key_norm = key.strip().lower()
-                value_norm = value.strip()
-                if not value_norm:
-                    continue
-                if key_norm in title_keys and not title_value:
-                    title_value = value_norm
-                    continue
-                if key_norm in configured_lower:
-                    field_values[key_norm] = value_norm
-
-            if title_value and field_values:
-                candidates.append((title_value, field_values))
-
-        if not candidates:
-            return answer
-
-        # Prefer longer titles first to avoid partial replacements.
-        deduped: dict[str, dict[str, str]] = {}
-        for title, values in candidates:
-            deduped.setdefault(title, values)
-
-        updated = answer
-        for title in sorted(deduped.keys(), key=len, reverse=True):
-            values = deduped[title]
-            parts = []
-            for field in configured_fields:
-                value = values.get(field.lower())
-                if value:
-                    parts.append(f"{field}: **{value}**")
-            if not parts:
-                continue
-            inline = " (" + "; ".join(parts) + ")"
-            if title + inline in updated or f"**{title}**{inline}" in updated:
-                continue
-            bold_title = f"**{title}**"
-            if bold_title in updated:
-                updated = updated.replace(bold_title, bold_title + inline, 1)
-            else:
-                updated = updated.replace(title, title + inline, 1)
-
-        def _norm(text: str) -> str:
-            return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
-
-        def _tokens(text: str) -> set[str]:
-            return {t for t in _norm(text).split() if t}
-
-        # Fallback pass: rewrite bullet lines using fuzzy title matching.
-        title_field_map: dict[str, str] = {}
-        for title, values in deduped.items():
-            parts = []
-            for field in configured_fields:
-                value = values.get(field.lower())
-                if value:
-                    parts.append(f"{field}: **{value}**")
-            if parts:
-                title_field_map[title] = " (" + "; ".join(parts) + ")"
-
-        if title_field_map:
-            lines = updated.splitlines()
-            used_titles: set[str] = set()
-            for idx, line in enumerate(lines):
-                m = re.match(r"^(\s*-\s+\*\*)([^*]+)(\*\*.*)$", line)
-                if not m:
-                    continue
-                product_name = m.group(2).strip()
-                if not product_name or "product_id:" in line.lower():
-                    continue
-
-                product_tokens = _tokens(product_name)
-                if not product_tokens:
-                    continue
-
-                best_title = ""
-                best_score = 0.0
-                product_norm = _norm(product_name)
-                for title in title_field_map:
-                    if title in used_titles:
-                        continue
-                    title_norm = _norm(title)
-                    if not title_norm:
-                        continue
-                    if title_norm in product_norm or product_norm in title_norm:
-                        score = 1.0
-                    else:
-                        title_tokens = _tokens(title)
-                        if not title_tokens:
-                            continue
-                        overlap = len(product_tokens & title_tokens)
-                        score = overlap / max(1, len(product_tokens))
-                    if score > best_score:
-                        best_score = score
-                        best_title = title
-
-                if best_title and best_score >= 0.5:
-                    inline = title_field_map[best_title]
-                    suffix = m.group(3)
-                    if suffix.startswith("**"):
-                        lines[idx] = f"{m.group(1)}{product_name}**{inline}{suffix[2:]}"
-                    else:
-                        lines[idx] = f"{m.group(1)}{product_name}{inline}{suffix}"
-                    used_titles.add(best_title)
-
-            updated = "\n".join(lines)
-
-        return updated
-    
     def _format_context(self, chunks: list[RetrievedChunk]) -> str:
         chunks_text = "\n\n".join(f"[{i+1}] {c.text}" for i, c in enumerate(chunks))
         configured_fields = getattr(self.retriever, "configured_context_fields", []) or []
         if not configured_fields:
             return chunks_text
         fields_csv = ", ".join(configured_fields)
-        inline_example = "Product Name (" + "; ".join(f"{f}: **value**" for f in configured_fields) + ")"
+        inline_example = "Item (" + "; ".join(f"{f}: **value**" for f in configured_fields) + ")"
         preamble = (
             "Configured traceability fields: " + fields_csv + "\n"
-            "When mentioning a product by name, include these configured fields inline immediately after the name.\n"
+            "When mentioning an item, include these configured fields inline immediately after its label.\n"
             "Use format: " + inline_example + "\n"
-            "Do not include non-configured identifier fields (for example upc/document_id/sku) unless explicitly asked."
+            "Do not include non-configured traceability fields unless explicitly asked."
         )
         return preamble + "\n\n" + chunks_text
     
@@ -1201,7 +1087,14 @@ class DecomposedRAGPipeline:
             async with semaphore:
                 return await self._answer_subquestion(sub_q)
 
-        return await asyncio.gather(*(_run_one(sub_q) for sub_q in sub_qs))
+        tasks = [asyncio.create_task(_run_one(sub_q)) for sub_q in sub_qs]
+        try:
+            return await asyncio.gather(*tasks)
+        except RankerUnavailableError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
     
     async def _answer_subquestion(self, sub_q: str) -> SubQuestionResult:
         chunks = await self.retriever.retrieve(sub_q)
@@ -1259,13 +1152,6 @@ class DecomposedRAGPipeline:
         final = await self.llm.complete(SYNTHESIS_PROMPT.format(
             original_question=question, preliminary_answer=current, sub_qa_pairs=sub_pairs or "None"
         ), label="LLM synthesis")
-        chunk_texts = [c.text for c in initial_chunks]
-        for sub in all_subs:
-            for chunk in sub.retrieved_chunks:
-                content = chunk.get("content")
-                if isinstance(content, str):
-                    chunk_texts.append(content)
-        final = self._inject_inline_context_fields_from_texts(final, chunk_texts)
         _ck("pipeline: synthesis – done", t)
         
         _ck("pipeline.run – TOTAL", t_run)
@@ -1326,7 +1212,14 @@ class DecomposedRAGPipeline:
                     return sub_q, chunks
 
             t = _ck(f"pipeline: round {rnd} efficient retrieve ({num_sub_qs} sub-Qs) – start")
-            subq_results = await asyncio.gather(*(_retrieve_for_subq(sq) for sq in sub_qs))
+            subq_tasks = [asyncio.create_task(_retrieve_for_subq(sq)) for sq in sub_qs]
+            try:
+                subq_results = await asyncio.gather(*subq_tasks)
+            except RankerUnavailableError:
+                for task in subq_tasks:
+                    task.cancel()
+                await asyncio.gather(*subq_tasks, return_exceptions=True)
+                raise
             _ck(f"pipeline: round {rnd} efficient retrieve – done", t)
 
             # Combine & de-duplicate retrieved chunks across all sub-questions
@@ -1391,14 +1284,6 @@ class DecomposedRAGPipeline:
             ),
             label="LLM efficient synthesis",
         )
-        chunk_texts = [c.text for c in initial_chunks]
-        for rd in rounds_data:
-            for sub in rd.get("sub_questions", []):
-                for chunk in sub.get("chunks", []):
-                    content = chunk.get("content")
-                    if isinstance(content, str):
-                        chunk_texts.append(content)
-        final = self._inject_inline_context_fields_from_texts(final, chunk_texts)
         _ck("pipeline: efficient synthesis – done", t)
 
         _ck("pipeline.run_efficient – TOTAL", t_run)
@@ -1430,8 +1315,12 @@ _tool_use_cosmos_cfg: dict = {}
 _tool_use_source_cfg: dict = {}
 _tool_use_source_embed: dict = {}
 _tool_use_source_ft: dict = {}
+_tool_use_source_partition: dict = {}
 _tool_use_all_embed: set = set()
+_tool_use_context_fields: list[str] = []
 _tool_use_max_retries: int = 5
+_tool_use_max_search_rounds: int = 4
+_tool_use_max_agent_turns: int = 50
 _tool_use_rerank_mul: int = 1
 _tool_use_prune_k: int = 20
 _tool_use_context_limit: int = 270000
@@ -1439,12 +1328,96 @@ _tool_use_use_hyde: bool = False
 _tool_use_use_ranker: bool = False
 _tool_use_r_http: httpx.AsyncClient | None = None
 _tool_use_r_url: str = ""
-_tool_use_r_tok: str = ""
+_tool_use_r_tok: str | Callable[[], str] = ""
+_tool_use_r_fail: bool = False
 _tool_use_r_bs: int = 16
 _tool_use_r_mr: int = 5
 _tool_use_query_template: str = ""
 
 _TIKTOKEN_ENC = tiktoken.get_encoding("o200k_base")
+
+
+class ToolUseRunError(RuntimeError):
+    """One or more tool-use questions could not produce a valid final answer."""
+
+
+@dataclass
+class _ToolUseResearchProgress:
+    initial_search_completed: bool = False
+    search_rounds: int = 0
+    attempted_queries: list[str] = field(default_factory=list)
+    findings: dict[str, str] = field(default_factory=dict)
+    unresolved_gaps: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "initial_search_completed": self.initial_search_completed,
+            "search_rounds": self.search_rounds,
+            "attempted_queries": list(self.attempted_queries),
+            "findings": dict(self.findings),
+            "unresolved_gaps": list(self.unresolved_gaps),
+            "notes": list(self.notes),
+        }
+
+
+def _tool_use_research_limits(pipeline: dict) -> tuple[int, int]:
+    limits = []
+    for name, default, minimum in (
+        ("max_search_rounds", 4, 0), ("max_agent_turns", 50, 1),
+    ):
+        value = pipeline.get(name, default)
+        if type(value) is not int or value < minimum:
+            raise ConfigurationError(f"pipeline.{name} must be an integer >= {minimum}, got {value!r}")
+        limits.append(value)
+    return limits[0], limits[1]
+
+
+def _tool_use_answer(arguments: str) -> str:
+    payload = json.loads(arguments)
+    if not isinstance(payload, dict):
+        raise ValueError("final_answer arguments must be an object")
+    answer = payload.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        raise ValueError("final_answer.answer must be a nonempty string")
+    return answer.strip()
+
+
+def _tool_use_prune_ids(arguments: str) -> list[str]:
+    payload = json.loads(arguments)
+    if not isinstance(payload, dict) or not isinstance(payload.get("docids"), list):
+        raise ValueError("prune.docids must be an array of document IDs")
+    docids = payload["docids"]
+    if any(not isinstance(docid, str) or not docid for docid in docids):
+        raise ValueError("prune.docids must contain nonempty strings")
+    return docids
+
+
+def _build_tool_use_query_template(
+    template: str,
+    prune_k: int,
+) -> str:
+    return template.format(
+        prune_k=prune_k,
+        question="{question}",
+    )
+
+
+def _build_traceability_reminder(context_fields: list[str]) -> str:
+    fields = list(dict.fromkeys(
+        str(field).strip() for field in context_fields if str(field).strip()
+    ))
+    if not fields:
+        return ""
+    return (
+        "Before giving the final answer, preserve these configured context "
+        f"fields for every source item you mention: {', '.join(fields)}. "
+        "Copy each field/value pair exactly from that item's source document "
+        "and place it inline immediately after the item label. Do not attach "
+        "these fields to measurements, claims, categories, summaries, or "
+        "other descriptive text. Do not invent, infer, swap, or copy values "
+        "between source items."
+    )
 
 
 def count_tokens(msgs) -> int:
@@ -1462,7 +1435,7 @@ def count_tokens(msgs) -> int:
 
 def _ranker_credential(rcfg: dict) -> AzureCliCredential:
     tenant_id = str(rcfg.get("tenant_id") or "").strip()
-    return AzureCliCredential(tenant_id=tenant_id) if tenant_id else AzureCliCredential()
+    return AzureCliCredential(tenant_id=tenant_id, process_timeout=60)
 
 
 def _get_cli_token(rcfg: dict, scope: str) -> str:
@@ -1503,17 +1476,20 @@ async def tool_use_embed(text: str) -> list[float]:
     return raw + [0.0] * (dim - len(raw))
 
 
-async def tool_use_vec_search(container, emb, top_k, ef):
+async def tool_use_vec_search(container, emb, top_k, ef, *, partition_key_path: str):
+    if top_k <= 0:
+        return []
     if not _SAFE_FIELD_RE.match(ef):
         raise ValueError(f"Invalid embedding field name: {ef!r}")
     sql = (
-        f"SELECT TOP @k c, VectorDistance(c.{ef}, @emb) AS score FROM c "
+        f"SELECT TOP @k {candidate_projection(partition_key_path)}, "
+        f"VectorDistance(c.{ef}, @emb) AS _score FROM c "
         f"ORDER BY VectorDistance(c.{ef}, @emb)"
     )
     t = _ck(f"vector query (top {top_k}, {container.id}) – start")
     try:
         results = [
-            item.get("c", item)
+            item
             async for item in container.query_items(
                 query=sql,
                 parameters=[{"name": "@k", "value": top_k}, {"name": "@emb", "value": emb}],
@@ -1550,6 +1526,11 @@ async def tool_use_rerank(query: str, docs: list[str], top_k: int) -> list[str]:
         ) from e
     if indices is None:
         _ck("semantic ranker – failed", t)
+        if _tool_use_r_fail:
+            raise RankerUnavailableError(
+                "Semantic ranker failed and ranker.fail_on_error is set; see the "
+                "[rerank_documents] messages above for the cause."
+            )
         print("  [rerank] Reranker failed, returning unranked results")
         return docs[:top_k]
     _ck(f"semantic ranker – done (selected {len(indices)} of {top_k})", t)
@@ -1600,20 +1581,31 @@ async def tool_use_do_search(query: str, containers: dict) -> str:
     else:
         emb = await tool_use_embed(query)
     tasks = []
+    task_containers = []
     for sid, ret in _tool_use_source_cfg.items():
         if sid in containers:
-            tasks.append(tool_use_vec_search(containers[sid], emb, ret["search_k"] * _tool_use_rerank_mul, _tool_use_source_embed[sid]))
+            tasks.append(tool_use_vec_search(
+                containers[sid], emb, ret["search_k"] * _tool_use_rerank_mul,
+                _tool_use_source_embed[sid], partition_key_path=_tool_use_source_partition[sid],
+            ))
+            task_containers.append(containers[sid])
     for sid, fields in _tool_use_source_ft.items():
         if sid in containers:
-            tasks.append(_tool_use_fulltext_search(containers[sid], fields, query, _tool_use_source_cfg[sid]["fulltext_search_k"] * _tool_use_rerank_mul))
+            tasks.append(_tool_use_fulltext_search(
+                containers[sid], fields, query,
+                _tool_use_source_cfg[sid]["fulltext_search_k"] * _tool_use_rerank_mul,
+                partition_key_path=_tool_use_source_partition[sid],
+            ))
+            task_containers.append(containers[sid])
     results = await asyncio.gather(*tasks)
-    seen, all_d = set(), []
-    for dl in results:
-        for d in dl:
-            did = d.get("id", "")
-            if did not in seen:
-                seen.add(did)
-                all_d.append(d)
+    references = [
+        (container, candidate)
+        for container, candidates in zip(task_containers, results)
+        for candidate in candidates
+    ]
+    t_fetch = _ck("fetch candidates – start")
+    all_d = await fetch_candidate_documents(references)
+    _ck(f"fetch candidates – done ({len(all_d)} documents)", t_fetch)
     total_k = sum(r["search_k"] + r["fulltext_search_k"] for r in _tool_use_source_cfg.values())
     texts = [tool_use_fmt(d) for d in all_d]
     if not texts:
@@ -1629,7 +1621,7 @@ async def tool_use_do_search(query: str, containers: dict) -> str:
     return out
 
 
-async def _tool_use_fulltext_search(container, fields, query, top_k):
+async def _tool_use_fulltext_search(container, fields, query, top_k, *, partition_key_path: str):
     """Wrapper around utils.fulltext.fulltext_search that emits _ck checkpoints."""
     if not fields:
         normalized_fields = []
@@ -1642,7 +1634,10 @@ async def _tool_use_fulltext_search(container, fields, query, top_k):
         return []
 
     t = _ck(f"fulltext (top {top_k}, {container.id}, {len(normalized_fields)} fields) – start")
-    items = await fulltext_search(container, normalized_fields, query, top_k)
+    items = await fulltext_search(
+        container, normalized_fields, query, top_k,
+        partition_key_path=partition_key_path,
+    )
     _ck(f"fulltext – done ({len(items)} results, {container.id})", t)
     return items
 
@@ -1705,15 +1700,140 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
     tc = {"initial_search": 0, "search": 0, "prune": 0, "find_information_gaps": 0, "final_answer": 0}
     doc_cache: dict = {}
     initial_msg = msgs[0]
+    progress = _ToolUseResearchProgress()
+    initial_search_started = False
+    agent_turns = 0
     retries = 0
     non_prune_rounds = 0
-    for iteration in range(50):
+    traceability_reminder_added = False
+
+    def result(answer: str, reason: str, error: str | None = None) -> dict:
+        elapsed = round(time.perf_counter() - t0, 2)
+        status = "failed" if error else ("partial" if reason == "agent_turn_limit" else "completed")
+        if error:
+            _log_line(f"Question {qid} failed: {error}", kind="error")
+        _ck(f"tool-use.run – TOTAL ({qid}) [{reason}]", t_run)
+        record = {
+            "question_id": qid, "query": query, "answer": answer,
+            "ground_truth": q_obj.get("answer", ""), "model": _tool_use_llm_cfg["llm_model"],
+            "rounds": agent_turns, "elapsed_seconds": elapsed, "tool_calls": tc,
+            "status": status, "termination_reason": reason,
+            "research_progress": progress.snapshot(),
+        }
+        if error:
+            record["error"] = error
+        return record
+
+    def reset_context(evidence: str) -> None:
+        summary = progress.snapshot()
+        summaries = summary["findings"]
+        omitted = 0
+        while True:
+            summary["findings_omitted_from_context"] = omitted
+            resume = {
+                "role": "user",
+                "content": (
+                    "Research progress survived context compaction. Do not restart research or "
+                    "repeat initial_search. Findings below are source excerpts, not complete "
+                    "documents; notes and gaps are provisional, not independent evidence. "
+                    f"Follow-up search rounds used: {progress.search_rounds}/"
+                    f"{_tool_use_max_search_rounds}.\n"
+                    + json.dumps(summary, ensure_ascii=False)
+                ),
+            }
+            if count_tokens([initial_msg, resume]) <= _tool_use_context_limit * 0.4 or not summaries:
+                break
+            summaries.pop(next(iter(summaries)))
+            omitted += 1
+        header_tokens = count_tokens([initial_msg, resume])
+        allowance = int(_tool_use_context_limit * 0.75) - header_tokens - 64
+        if allowance <= 0:
+            raise ToolUseRunError("Research progress and instructions exceed the configured context_limit")
+        tokens = _TIKTOKEN_ENC.encode(evidence)
+        if len(tokens) > allowance:
+            evidence = _TIKTOKEN_ENC.decode(tokens[:allowance]) + "\n[Evidence truncated to fit context.]"
+            _log_line(f"Question {qid}: truncated retained evidence to fit context_limit", kind="warn")
+        if omitted:
+            _log_line(
+                f"Question {qid}: {omitted} source excerpts omitted from compacted context; "
+                "the complete progress ledger remains in the result.",
+                kind="warn",
+            )
+        msgs[:] = [initial_msg, resume, {"role": "user", "content": evidence}]
+
+    async def finalize(reason: str) -> dict:
+        nonlocal agent_turns
+        _log_line(f"Question {qid}: final synthesis required ({reason})", kind="info")
+        msgs.append({
+            "role": "user",
+            "content": (
+                "Research is finished. Do not search, prune, or restart. Submit final_answer "
+                "now using only the available evidence. Cover each part of the original "
+                "question and explicitly state unmet requirements, unresolved gaps and "
+                "anything not verified; do not invent a match to fill a gap.\n"
+                + json.dumps({
+                    "attempted_queries": progress.attempted_queries,
+                    "unresolved_gaps": progress.unresolved_gaps,
+                }, ensure_ascii=False)
+                + "\n" + _build_traceability_reminder(_tool_use_context_fields)
+            ),
+        })
+        last_error = "No valid final answer"
+        for attempt in range(max(1, _tool_use_max_retries)):
+            agent_turns += 1
+            try:
+                t_step = _ck("LLM final synthesis – start")
+                response = await _tool_use_llm.chat.completions.create(
+                    model=_tool_use_llm_cfg["llm_model"], messages=msgs,
+                    tools=[tool for tool in TOOLS if tool["function"]["name"] == "final_answer"],
+                    tool_choice={"type": "function", "function": {"name": "final_answer"}},
+                    temperature=_tool_use_llm_cfg.get("temperature", 0),
+                    max_completion_tokens=_tool_use_llm_cfg["max_completion_tokens"],
+                )
+                _ck("LLM final synthesis – done", t_step)
+                if not response.choices:
+                    raise ValueError("Final synthesis returned no choices")
+                message = response.choices[0].message
+                calls = message.tool_calls or []
+                if len(calls) != 1 or calls[0].function.name != "final_answer":
+                    raise ValueError("Final synthesis must submit exactly one final_answer call")
+                tc["final_answer"] += 1
+                answer = _tool_use_answer(calls[0].function.arguments)
+                return result(answer, reason)
+            except (ValueError, TypeError) as error:
+                last_error = str(error)
+                _log_line(f"Question {qid}: invalid final synthesis: {last_error}", kind="warn")
+            except (oai.APIStatusError, oai.APIConnectionError) as error:
+                last_error = str(error)
+                _log_line(f"Question {qid}: final synthesis request failed: {last_error}", kind="error")
+                if isinstance(error, oai.APIStatusError) and error.status_code not in (408, 409, 429) and error.status_code < 500:
+                    break
+                if attempt + 1 < max(1, _tool_use_max_retries):
+                    await asyncio.sleep(min(5 * 2 ** attempt, 60))
+            msgs.append({
+                "role": "user",
+                "content": f"Final synthesis was invalid: {last_error}. Submit a nonempty final_answer.",
+            })
+        return result("", "finalization_failed", f"{reason}: {last_error}")
+
+    for iteration in range(_tool_use_max_agent_turns):
+        if progress.initial_search_completed and progress.search_rounds >= _tool_use_max_search_rounds:
+            return await finalize("research_budget_exhausted")
         try:
+            agent_turns += 1
             t_step = _ck(f"LLM agent step – start (iter {iteration})")
+            available_tools = [
+                tool for tool in TOOLS
+                if (tool["function"]["name"] != "initial_search")
+                == progress.initial_search_completed
+            ]
             r = await _tool_use_llm.chat.completions.create(
                 model=_tool_use_llm_cfg["llm_model"],
                 messages=msgs,
-                tools=TOOLS,
+                tools=available_tools,
+                tool_choice="auto" if progress.initial_search_completed else {
+                    "type": "function", "function": {"name": "initial_search"},
+                },
                 temperature=_tool_use_llm_cfg.get("temperature", 0),
                 max_completion_tokens=_tool_use_llm_cfg["max_completion_tokens"],
             )
@@ -1729,45 +1849,54 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
             retries += 1
             print(f"  LLM error ({retries}/{_tool_use_max_retries}): {e}")
             if "context_length_exceeded" in str(e):
-                print(f"  [auto-prune] Context overflow detected, rolling back messages...")
-                while len(msgs) > 1 and count_tokens(msgs) > _tool_use_context_limit * 0.8:
-                    msgs.pop()
-                while len(msgs) > 1:
-                    last = msgs[-1]
-                    if isinstance(last, dict) and last.get("role") == "assistant" and last.get("tool_calls"):
-                        msgs.pop()
-                    elif isinstance(last, dict) and last.get("role") == "tool":
-                        msgs.pop()
-                    else:
-                        break
-                msgs.append({"role": "user", "content": "CRITICAL: Context limit exceeded. You MUST call prune NOW to keep only the most relevant document IDs before doing anything else."})
-                print(f"  [auto-prune] Rolled back to {count_tokens(msgs)} tokens, forcing prune")
-                retries = 0
+                reset_context("\n\n".join(list(doc_cache.values())[:_tool_use_prune_k]))
+                if retries >= _tool_use_max_retries:
+                    return await finalize("context_limit")
                 continue
             if retries >= _tool_use_max_retries:
-                elapsed = round(time.perf_counter() - t0, 2)
-                print(f"  Max retries ({_tool_use_max_retries}) exceeded, returning partial result")
-                _ck(f"tool-use.run – TOTAL ({qid}) [max_retries]", t_run)
-                return {"question_id": qid, "query": query, "answer": "", "ground_truth": q_obj.get("answer", ""),
-                        "model": _tool_use_llm_cfg["llm_model"], "rounds": iteration + 1, "elapsed_seconds": elapsed,
-                        "tool_calls": tc, "error": f"Max retries exceeded: {e}"}
+                return result("", "llm_error", f"Max retries exceeded: {e}")
             await asyncio.sleep(min(5 * 2 ** retries, 300))
             continue
         m = r.choices[0].message
+        if m.content:
+            progress.notes.append(m.content)
         msgs.append(m.model_dump(exclude_none=True))
         if not m.tool_calls:
-            answer = m.content or ""
-            print(f"  Answer: {answer[:200]}...")
-            elapsed = round(time.perf_counter() - t0, 2)
-            print(f"  Elapsed: {elapsed}s")
-            _ck(f"tool-use.run – TOTAL ({qid})", t_run)
-            return {"question_id": qid, "query": query, "answer": answer, "ground_truth": q_obj.get("answer", ""),
-                    "model": _tool_use_llm_cfg["llm_model"], "rounds": iteration + 1, "elapsed_seconds": elapsed,
-                    "tool_calls": tc}
-        for t in m.tool_calls:
-            tc[t.function.name] = tc.get(t.function.name, 0) + 1
+            if not progress.initial_search_completed:
+                msgs.append({"role": "user", "content": "Complete initial_search before answering."})
+                continue
+            if not traceability_reminder_added and _tool_use_context_fields:
+                msgs.append({
+                    "role": "user",
+                    "content": _build_traceability_reminder(_tool_use_context_fields),
+                })
+                traceability_reminder_added = True
+                continue
+            if not isinstance(m.content, str) or not m.content.strip():
+                return await finalize("empty_model_answer")
+            return result(m.content.strip(), "model_answer")
         call_names = [t.function.name for t in m.tool_calls]
+        if not progress.initial_search_completed and "initial_search" not in call_names:
+            for call in m.tool_calls:
+                msgs.append({"role": "tool", "tool_call_id": call.id,
+                             "content": json.dumps({"error": "initial_search must run first, alone."})})
+            continue
         if "final_answer" in call_names:
+            tc["final_answer"] += sum(name == "final_answer" for name in call_names)
+            if not traceability_reminder_added and _tool_use_context_fields:
+                for t in m.tool_calls:
+                    msgs.append({
+                        "role": "tool",
+                        "tool_call_id": t.id,
+                        "content": json.dumps({
+                            "status": "revise",
+                            "instruction": _build_traceability_reminder(
+                                _tool_use_context_fields
+                            ),
+                        }),
+                    })
+                traceability_reminder_added = True
+                continue
             if len(call_names) > 1:
                 print(f"  [warn] final_answer mixed with other calls; returning error for non-final_answer calls")
                 for t in m.tool_calls:
@@ -1776,19 +1905,17 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                                      "content": json.dumps({"error": "final_answer must be the only tool call in a turn; re-issue this call separately."})})
             fa_call = next(t for t in m.tool_calls if t.function.name == "final_answer")
             try:
-                a = json.loads(fa_call.function.arguments)
-                answer = a.get("answer", "")
-            except (json.JSONDecodeError, TypeError):
-                answer = ""
+                answer = _tool_use_answer(fa_call.function.arguments)
+            except (ValueError, TypeError) as error:
+                for call in m.tool_calls:
+                    if call.function.name == "final_answer":
+                        msgs.append({"role": "tool", "tool_call_id": call.id,
+                                     "content": json.dumps({"error": str(error)})})
+                _log_line(f"Question {qid}: invalid final_answer: {error}", kind="warn")
+                continue
             msgs.append({"role": "tool", "tool_call_id": fa_call.id,
                          "content": json.dumps({"status": "ok"})})
-            print(f"  Answer (via final_answer): {answer[:200]}...")
-            elapsed = round(time.perf_counter() - t0, 2)
-            print(f"  Elapsed: {elapsed}s")
-            _ck(f"tool-use.run – TOTAL ({qid})", t_run)
-            return {"question_id": qid, "query": query, "answer": answer, "ground_truth": q_obj.get("answer", ""),
-                    "model": _tool_use_llm_cfg["llm_model"], "rounds": iteration + 1, "elapsed_seconds": elapsed,
-                    "tool_calls": tc}
+            return result(answer, "final_answer")
         if "prune" in call_names and len(call_names) > 1:
             print(f"  [warn] prune mixed with other calls; returning error for non-prune calls")
             for t in m.tool_calls:
@@ -1797,48 +1924,53 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                                  "content": json.dumps({"error": "prune must be the only tool call in a turn; re-issue this call separately."})})
             prune_call = next(t for t in m.tool_calls if t.function.name == "prune")
             try:
-                a = json.loads(prune_call.function.arguments)
-            except (json.JSONDecodeError, TypeError) as e:
+                docids = _tool_use_prune_ids(prune_call.function.arguments)
+            except (ValueError, TypeError) as e:
                 msgs.append({"role": "tool", "tool_call_id": prune_call.id,
                              "content": json.dumps({"error": f"Malformed tool arguments: {e}"})})
                 continue
-            out = await tool_use_do_prune(a["docids"], containers, doc_cache)
-            msgs.clear()
-            msgs.append(initial_msg)
-            msgs.append({"role": "assistant", "content": "I'll prune the context to focus on the most relevant documents."})
-            msgs.append({"role": "user", "content": out})
-            print(f"  [prune] Kept {len(a['docids'])} docs, context reset")
+            out = await tool_use_do_prune(docids, containers, doc_cache)
+            tc["prune"] += 1
+            reset_context(out)
+            print(f"  [prune] Kept {len(docids)} docs, context reset")
             continue
 
         async def _exec(t):
+            nonlocal initial_search_started
             try:
                 a = json.loads(t.function.arguments)
             except (json.JSONDecodeError, TypeError) as e:
                 return t, json.dumps({"error": f"Malformed tool arguments: {e}"}), False
+            if not isinstance(a, dict):
+                return t, json.dumps({"error": "Tool arguments must be a JSON object"}), False
             if t.function.name == "initial_search":
+                if initial_search_started:
+                    return t, json.dumps({
+                        "error": "initial_search has already run. Use existing evidence, targeted search, or final_answer.",
+                    }), False
+                initial_search_started = True
+                tc["initial_search"] += 1
+                progress.attempted_queries.append(query)
                 out = await tool_use_do_search(query, containers)
-                try:
-                    for h in json.loads(out):
-                        if h.get("text"):
-                            doc_cache[h["docid"]] = h["text"]
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    print(f"  [initial_search] failed to parse/cache search results: {e}")
+                progress.initial_search_completed = True
             elif t.function.name == "search":
+                if not progress.initial_search_completed:
+                    return t, json.dumps({"error": "initial_search must complete before follow-up searches."}), False
+                if not isinstance(a.get("query"), str) or not a["query"].strip():
+                    return t, json.dumps({"error": "search.query must be a nonempty string"}), False
+                tc["search"] += 1
+                progress.attempted_queries.append(a["query"])
                 out = await tool_use_do_search(a["query"], containers)
-                try:
-                    for h in json.loads(out):
-                        if h.get("text"):
-                            doc_cache[h["docid"]] = h["text"]
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    print(f"  [search] failed to parse/cache search results: {e}")
             elif t.function.name == "prune":
-                out = await tool_use_do_prune(a["docids"], containers, doc_cache)
+                try:
+                    docids = _tool_use_prune_ids(t.function.arguments)
+                except (ValueError, TypeError) as error:
+                    return t, json.dumps({"error": str(error)}), False
+                tc["prune"] += 1
+                out = await tool_use_do_prune(docids, containers, doc_cache)
                 return t, out, True
             elif t.function.name == "find_information_gaps":
+                tc["find_information_gaps"] += 1
                 gap_msgs = []
                 for mm in msgs:
                     if not isinstance(mm, dict):
@@ -1865,13 +1997,26 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                         max_completion_tokens=1024,
                     )
                     _ck("LLM find_gaps – done", t_gap)
-                    out = gap_r.choices[0].message.content or "No gaps identified."
+                    out = gap_r.choices[0].message.content
+                    if not isinstance(out, str) or not out.strip():
+                        out = json.dumps({"error": "Gap analysis returned no content; gaps remain unassessed."})
+                    else:
+                        progress.unresolved_gaps = [out]
                 except (oai.BadRequestError, oai.RateLimitError, oai.APIStatusError) as e:
                     print(f"  [find_gaps] LLM error: {e}")
                     out = json.dumps({"error": str(e)})
                 print(f"  [find_gaps] {out[:200]}")
             else:
                 out = json.dumps({"error": f"Unknown tool: {t.function.name}"})
+            if t.function.name in {"initial_search", "search"}:
+                hits = json.loads(out)
+                if not isinstance(hits, list):
+                    raise ToolUseRunError("Search returned invalid evidence: expected a list of documents")
+                for hit in hits:
+                    if not isinstance(hit, dict) or not isinstance(hit.get("docid"), str) or not isinstance(hit.get("text"), str):
+                        raise ToolUseRunError("Search returned invalid document identity or text")
+                    doc_cache[hit["docid"]] = hit["text"]
+                    progress.findings[hit["docid"]] = hit["text"][:512]
             return t, out, False
 
         if "initial_search" in call_names and len(call_names) > 1:
@@ -1883,15 +2028,14 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
             m_tool_calls = [t for t in m.tool_calls if t.function.name == "initial_search"]
         else:
             m_tool_calls = m.tool_calls
+        if any(call.function.name == "search" for call in m_tool_calls):
+            progress.search_rounds += 1
         print(f"  Executing {len(m_tool_calls)} tool calls in parallel...")
         results = await asyncio.gather(*(_exec(t) for t in m_tool_calls))
         pruned = False
         for t, out, is_prune in results:
             if is_prune:
-                msgs.clear()
-                msgs.append(initial_msg)
-                msgs.append({"role": "assistant", "content": "I'll prune the context to focus on the most relevant documents."})
-                msgs.append({"role": "user", "content": out})
+                reset_context(out)
                 try:
                     prune_args = json.loads(t.function.arguments)
                     print(f"  [prune] Kept {len(prune_args['docids'])} docs, context reset")
@@ -1905,9 +2049,11 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
             msgs.append({"role": "tool", "tool_call_id": t.id, "content": out})
             try:
                 a = json.loads(t.function.arguments)
+                if not isinstance(a, dict):
+                    raise ValueError("Tool arguments must be a JSON object")
                 vals = list(a.values())
-                print(f"  [{t.function.name}] {vals[0][:80] if vals and isinstance(vals[0], str) else '...'}")
-            except (json.JSONDecodeError, TypeError):
+                print(f"  [{t.function.name}] {vals[0][:1024] if vals and isinstance(vals[0], str) else '...'}")
+            except (ValueError, TypeError):
                 print(f"  [{t.function.name}] (malformed args)")
         non_prune_rounds += 1
         token_est = count_tokens(msgs)
@@ -1922,20 +2068,19 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                 keep_ids = all_ids
             parts = [f'<doc id="{did}">\n{doc_cache[did]}\n</doc>' for did in keep_ids]
             pruned_ctx = "Pruned context (only these documents remain):\n\n" + "\n\n".join(parts)
-            msgs.clear()
-            msgs.append(initial_msg)
-            msgs.append({"role": "assistant", "content": "I'll prune the context to focus on the most relevant documents."})
-            msgs.append({"role": "user", "content": pruned_ctx})
+            reset_context(pruned_ctx)
             token_est_new = count_tokens(msgs)
             tc["prune"] = tc.get("prune", 0) + 1
             print(f"  [auto-prune] Token overflow after tool results ({token_est} tokens), kept {len(keep_ids)} docs, reset to {token_est_new} tokens")
             token_est = token_est_new
         msgs.append({"role": "user", "content": f"Token usage: {token_est} / {_tool_use_context_limit}. Non-prune tool calls since start: {non_prune_rounds}"})
         print(f"  Token usage: {token_est} / {_tool_use_context_limit}. Non-prune rounds: {non_prune_rounds}")
-    elapsed = round(time.perf_counter() - t0, 2)
-    _ck(f"tool-use.run – TOTAL ({qid}) [iter_cap]", t_run)
-    return {"question_id": qid, "query": query, "answer": "", "ground_truth": q_obj.get("answer", ""),
-            "model": _tool_use_llm_cfg["llm_model"], "rounds": 50, "elapsed_seconds": elapsed, "tool_calls": tc}
+    reason = (
+        "research_budget_exhausted"
+        if progress.initial_search_completed and progress.search_rounds >= _tool_use_max_search_rounds
+        else "agent_turn_limit"
+    )
+    return await finalize(reason)
 
 
 def init_tool_use_clients() -> None:
@@ -1946,20 +2091,45 @@ def init_tool_use_clients() -> None:
     global _tool_use_llm, _tool_use_embed_client
     global _tool_use_llm_cfg, _tool_use_embed_cfg, _tool_use_cosmos_cfg
     global _tool_use_source_cfg, _tool_use_source_embed, _tool_use_source_ft, _tool_use_all_embed
+    global _tool_use_source_partition
+    global _tool_use_context_fields
     global _tool_use_max_retries, _tool_use_rerank_mul, _tool_use_prune_k
+    global _tool_use_max_search_rounds, _tool_use_max_agent_turns
     global _tool_use_context_limit, _tool_use_use_hyde, _tool_use_use_ranker
-    global _tool_use_r_http, _tool_use_r_url, _tool_use_r_tok, _tool_use_r_bs, _tool_use_r_mr
+    global _tool_use_r_http, _tool_use_r_url, _tool_use_r_tok, _tool_use_r_bs, _tool_use_r_mr, _tool_use_r_fail
     global _tool_use_query_template
 
     cfg = CONFIG
+    _tool_use_max_search_rounds, _tool_use_max_agent_turns = _tool_use_research_limits(
+        cfg.get("pipeline") or {},
+    )
     _tool_use_llm_cfg = cfg["llm"]
     _tool_use_embed_cfg = cfg["embedding"]
     _tool_use_cosmos_cfg = cfg["cosmos"]
     sources = _tool_use_cosmos_cfg["sources"]
     _tool_use_source_cfg = {s["id"]: s["retrieval"] for s in sources}
     _tool_use_source_embed = {s["id"]: s["embedding_field"] for s in sources}
-    _tool_use_source_ft = {s["id"]: s["retrieval"]["fulltext_fields"] for s in sources}
+    _tool_use_source_ft = {}
+    for s in sources:
+        configured = s["retrieval"]["fulltext_fields"]
+        configured = list(configured) if isinstance(configured, (list, tuple)) else []
+        valid = [f for f in configured if isinstance(f, str) and is_fulltext_field_path(f)]
+        for field in configured:
+            if field not in valid:
+                _log_line(
+                    f"Source {s['id']!r}: skipping unsupported full-text field {field!r} "
+                    "(use dotted identifiers, with an optional trailing '[]' for string arrays)",
+                    kind="warn",
+                )
+        _tool_use_source_ft[s["id"]] = valid
+    _tool_use_source_partition = {s["id"]: str(s.get("partition_key_path") or "") for s in sources}
     _tool_use_all_embed = set(_tool_use_source_embed.values())
+    _tool_use_context_fields = list(dict.fromkeys(
+        str(field).strip()
+        for source in sources
+        for field in source.get("context_fields", [])
+        if str(field).strip()
+    ))
     _tool_use_max_retries = int(_tool_use_llm_cfg["max_retries"])
     _tool_use_rerank_mul = int(cfg["ranker"].get("rerank_multiplier", 1))
     _tool_use_prune_k = int(cfg.get("prune_k", 20))
@@ -1967,7 +2137,7 @@ def init_tool_use_clients() -> None:
     _tool_use_use_hyde = bool(cfg.get("hyde", False))
 
     tp = (
-        get_bearer_token_provider(AzureCliCredential(), _tool_use_llm_cfg["token_scope"])
+        get_bearer_token_provider(AzureCliCredential(process_timeout=60), _tool_use_llm_cfg["token_scope"])
         if _tool_use_llm_cfg["use_rbac_auth"]
         else None
     )
@@ -1977,7 +2147,7 @@ def init_tool_use_clients() -> None:
         **({"azure_ad_token_provider": tp} if tp else {"api_key": _tool_use_llm_cfg["llm_api_key"]}),
     )
     embed_tp = (
-        get_bearer_token_provider(AzureCliCredential(), _tool_use_embed_cfg["token_scope"])
+        get_bearer_token_provider(AzureCliCredential(process_timeout=60), _tool_use_embed_cfg["token_scope"])
         if _tool_use_embed_cfg.get("use_rbac_auth")
         else None
     )
@@ -1998,12 +2168,16 @@ def init_tool_use_clients() -> None:
         _tool_use_r_url = build_ranker_url(rcfg)
         _tool_use_r_bs = int(rcfg["batch_size"])
         _tool_use_r_mr = int(rcfg["max_retries"])
+        _tool_use_r_fail = bool(rcfg.get("fail_on_error", False))
         token_scope = str(rcfg.get("token_scope") or DEFAULT_MANAGEMENT_SCOPE).strip()
-        _tool_use_r_tok = _get_cli_token(rcfg, token_scope)
+        _tool_use_r_tok = get_bearer_token_provider(_ranker_credential(rcfg), token_scope)
         _tool_use_r_http = httpx.AsyncClient(timeout=120)
 
     from prompts import DEFAULT_QUERY_TEMPLATE
-    _tool_use_query_template = DEFAULT_QUERY_TEMPLATE.replace("{prune_k}", str(_tool_use_prune_k))
+    _tool_use_query_template = _build_tool_use_query_template(
+        DEFAULT_QUERY_TEMPLATE,
+        _tool_use_prune_k,
+    )
 
 
 async def run_tool_use_mode(args) -> None:
@@ -2018,22 +2192,42 @@ async def run_tool_use_mode(args) -> None:
     _log_line(f"Processing {len(questions)} questions", kind="info")
     t_main = _ck("tool-use main – start")
     use_rbac_auth = cosmos_cfg.get("use_rbac_auth", False)
-    credential = AsyncAzureCliCredential() if use_rbac_auth else None
+    credential = AsyncAzureCliCredential(process_timeout=60) if use_rbac_auth else None
     cosmos = CosmosClient(cosmos_cfg["uri"], credential=credential or cosmos_cfg["key"])
     db = cosmos.get_database_client(cosmos_cfg["database_name"])
     containers = {s["id"]: db.get_container_client(s["container_name"]) for s in sources}
 
     try:
+        for s in sources:
+            if (
+                int(s["retrieval"].get("search_k", 0) or 0) > 0
+                or int(s["retrieval"].get("fulltext_search_k", 0) or 0) > 0
+            ):
+                _tool_use_source_partition[s["id"]] = await resolve_partition_key_path(
+                    containers[s["id"]], s.get("partition_key_path"), s["id"],
+                )
+        if _tool_use_use_ranker:
+            problem = await verify_ranker_token(_tool_use_r_tok, _tool_use_r_fail)
+            if problem:
+                _log_line(problem, kind="error")
         results = []
-        for q in tqdm(questions):
-            results.append(await process_question(q, containers))
-
         out_root = Path(args.output_root)
         out = out_root / "standard" / f"results_{time.strftime('%Y%m%d_%H%M%S')}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(results, indent=2))
-        print(f"\nSaved {len(results)} results to {out}")
+        for q in tqdm(questions):
+            results.append(await process_question(q, containers))
+            checkpoint = out.with_suffix(".json.tmp")
+            checkpoint.write_text(json.dumps(results, indent=2), encoding="utf-8")
+            checkpoint.replace(out)
+            _log_line(f"Saved {len(results)}/{len(questions)} results to {out}", kind="success")
+        _log_line(f"\nSaved {len(results)} results to {out}", kind="success")
         _ck(f"tool-use main – TOTAL ({len(results)} questions)", t_main)
+        failed = [r["question_id"] for r in results if r.get("status") == "failed" or r.get("error")]
+        if failed:
+            raise ToolUseRunError(
+                f"{len(failed)} question(s) failed: {', '.join(map(str, failed))}. "
+                f"Results, progress and errors were saved to {out}."
+            )
     finally:
         await cosmos.close()
         if credential is not None:
@@ -2124,7 +2318,7 @@ async def _run_tool_use_main(config_path: Path) -> None:
     _TIMING = args.timing
     _t0 = time.perf_counter()
     if _TIMING:
-        _log_line("Enabled: checkpoints printed as +<step_elapsed>s (total <from_start>s)", kind="timing")
+        _log_line("Enabled: starts show total time; completions show +<step_elapsed>s (total <from_start>s)", kind="timing")
 
     await run_tool_use_mode(args)
 
@@ -2189,7 +2383,7 @@ async def _run_decomposed_main(config_path: Path) -> None:
         kind="info"
     )
     if _TIMING:
-        _log_line("Enabled: checkpoints printed as +<step_elapsed>s (total <from_start>s)", kind="timing")
+        _log_line("Enabled: starts show total time; completions show +<step_elapsed>s (total <from_start>s)", kind="timing")
 
     t = _ck("retriever.initialize – start")
     await retriever.initialize()
@@ -2245,14 +2439,31 @@ async def _run_decomposed_main(config_path: Path) -> None:
             return await process(q)
 
     tasks = [asyncio.create_task(bounded_process(q)) for q in all_questions]
-    with tqdm(total=len(all_questions)) as pbar:
-        for task in asyncio.as_completed(tasks):
-            try:
-                results.append(await task)
-            except Exception as e:
-                _log_line(f"Error: {e}", kind="error")
-            finally:
-                pbar.update(1)
+    try:
+        with tqdm(total=len(all_questions)) as pbar:
+            for task in asyncio.as_completed(tasks):
+                try:
+                    results.append(await task)
+                except RankerUnavailableError:
+                    raise
+                except Exception as e:
+                    _log_line(f"Error: {e}", kind="error")
+                finally:
+                    pbar.update(1)
+    except RankerUnavailableError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        _log_line(
+            f"Run aborted: semantic ranker unavailable. Completed question traces remain in "
+            f"{output_path / 'intermediate'}.",
+            kind="error",
+        )
+        try:
+            await retriever.close()
+        finally:
+            await llm.close()
+        raise
     
     # Save final results - one answer file per input questions file
     llm_model = CONFIG["llm"]["llm_model"]
@@ -2332,7 +2543,7 @@ if __name__ == "__main__":
                 sys.stderr = _TeeStream(original_stderr, log_file)
                 try:
                     asyncio.run(main_async())
-                except ServiceConnectionError as e:
+                except (ServiceConnectionError, ConfigurationError, RankerUnavailableError, ToolUseRunError) as e:
                     sys.stdout = original_stdout
                     sys.stderr = original_stderr
                     print(f"\n\033[31mERROR: {e}\033[0m", file=sys.stderr)
@@ -2346,11 +2557,11 @@ if __name__ == "__main__":
                     sys.stderr = original_stderr
 
         shutil.copyfile(run_log_path, latest_log_path)
-        _log_line(f"wrote log: {run_log_path}", kind="timing")
-        _log_line(f"updated latest: {latest_log_path}", kind="timing")
+        _log_line(f"wrote log: {run_log_path}", kind="warn")
+        _log_line(f"updated latest: {latest_log_path}", kind="warn")
     else:
         try:
             asyncio.run(main_async())
-        except ServiceConnectionError as e:
+        except (ServiceConnectionError, ConfigurationError, RankerUnavailableError, ToolUseRunError) as e:
             print(f"\n\033[31mERROR: {e}\033[0m", file=sys.stderr)
             sys.exit(1)

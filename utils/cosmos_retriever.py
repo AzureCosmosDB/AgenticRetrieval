@@ -6,8 +6,8 @@ import logging
 import os
 import re
 import sys
-import time
 import warnings
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -26,6 +26,14 @@ from dynamic_retriever import (
     RetrievedChunk,
 )
 from greedy_log_det import greedy_log_det_select
+from utils.fulltext import fulltext_field_from_index_path, is_fulltext_field_path
+from utils.candidates import (
+    candidate_identity,
+    candidate_projection,
+    container_identity,
+    fetch_candidate_results,
+    resolve_partition_key_path,
+)
 
 
 def _runtime_module() -> Any:
@@ -113,7 +121,7 @@ RETRIEVAL_SOURCES = _get_source_config(CONFIG)
 
 # Re-export from utils.fulltext for backward compatibility
 from utils.fulltext import fulltext_search  # noqa: E402
-from utils.ranker import rerank_documents  # noqa: E402
+from utils.ranker import RankerUnavailableError, rerank_documents, verify_ranker_token  # noqa: E402
 
 
 class CombinedRetriever:
@@ -156,16 +164,17 @@ class CombinedRetriever:
         self._ranker_region = str(ranker_cfg.get("region", "")).strip()
         self._ranker_account = str(ranker_cfg.get("account_name", "")).strip()
         self._ranker_batch_size = int(ranker_cfg.get("batch_size", 32))
-        self._ranker_access_token: str | None = None
+        self._ranker_fail_on_error = bool(ranker_cfg.get("fail_on_error", False))
+        self._indexed_fields_cache: dict[str, list[str]] = {}
+        self._ranker_access_token: str | Callable[[], str] | None = None
         if self._use_ranker:
-            from azure.identity import AzureCliCredential as SyncAzureCliCredential
+            from azure.identity import AzureCliCredential as SyncAzureCliCredential, get_bearer_token_provider
             tenant_id = str(ranker_cfg.get("tenant_id", "")).strip()
             token_scope = str(ranker_cfg.get("token_scope", "")).strip()
             if not token_scope:
                 raise ValueError("ranker.token_scope must be set when ranker.use_ranker is enabled")
-            credential = SyncAzureCliCredential(tenant_id=tenant_id) if tenant_id else SyncAzureCliCredential()
-            token_obj = credential.get_token(token_scope)
-            self._ranker_access_token = token_obj.token
+            credential = SyncAzureCliCredential(tenant_id=tenant_id, process_timeout=60)
+            self._ranker_access_token = get_bearer_token_provider(credential, token_scope)
 
     @property
     def total_fulltext_k(self) -> int:
@@ -212,9 +221,14 @@ class CombinedRetriever:
             embedding_field = str(source.get("embedding_field") or "e").strip()
             if not self._is_safe_field_path(embedding_field):
                 embedding_field = "e"
-            fulltext_fields = [
-                field for field in _as_list_of_strings(source.get("fulltext_fields")) if self._is_safe_field_path(field)
-            ]
+            configured_fields = _as_list_of_strings(source.get("fulltext_fields"))
+            fulltext_fields = [field for field in configured_fields if is_fulltext_field_path(field)]
+            for field in configured_fields:
+                if field not in fulltext_fields:
+                    logging.warning(
+                        f"Source {source_id!r}: skipping unsupported full-text field {field!r} "
+                        "(use dotted identifiers, with an optional trailing '[]' for string arrays)"
+                    )
             normalized.append(
                 {
                     "id": source_id,
@@ -257,8 +271,32 @@ class CombinedRetriever:
         for source in self._sources:
             self._containers[source["id"]] = self._db.get_container_client(source["container_name"])
         self._llm = LLMClient()
+        try:
+            await self._validate_startup()
+        except BaseException:
+            await self.close()
+            raise
 
-    async def _fulltext_search(self, container, fields: list[str], query: str, top_k: int) -> list[dict]:
+    async def _validate_startup(self) -> None:
+        """Fail fast on setup problems that would otherwise surface mid-run."""
+        for source in self._sources:
+            container = self._containers[source["id"]]
+            if int(source.get("vector_k", 0) or 0) > 0 or int(source.get("fulltext_k", 0) or 0) > 0:
+                source["partition_key_path"] = await resolve_partition_key_path(
+                    container, source.get("partition_key_path"), source["id"],
+                )
+            if int(source.get("fulltext_k", 0) or 0) > 0:
+                self._ctrproxy = container
+                await self._indexed_fulltext_fields()
+        if self._use_ranker:
+            problem = await verify_ranker_token(self._ranker_access_token, self._ranker_fail_on_error)
+            if problem:
+                _log_line(problem, kind="error")
+
+    async def _fulltext_search(
+        self, container, fields: list[str], query: str, top_k: int, *,
+        partition_key_path: str,
+    ) -> list[dict]:
         if top_k <= 0 or not fields:
             return []
         t = _ck(f"fulltext (top {top_k}, {container.id}, {len(fields)} fields) – start")
@@ -272,7 +310,10 @@ class CombinedRetriever:
                     use_lock=True,
                 )
 
-        items = await fulltext_search(container, fields, query, top_k, log_fn=_log_fulltext_sql)
+        items = await fulltext_search(
+            container, fields, query, top_k, log_fn=_log_fulltext_sql,
+            partition_key_path=partition_key_path,
+        )
         _ck(f"fulltext – done ({len(items)} results, {container.id})", t)
         return items
 
@@ -283,6 +324,8 @@ class CombinedRetriever:
         query_emb: list[float],
         top_k: int,
         query_text: str = "",
+        *,
+        partition_key_path: str,
     ) -> list[dict]:
         if top_k <= 0:
             return []
@@ -296,7 +339,8 @@ class CombinedRetriever:
             elif len(adjusted_emb) < self._expected_vector_dim:
                 adjusted_emb = adjusted_emb + [0.0] * (self._expected_vector_dim - len(adjusted_emb))
         sql = (
-            f"SELECT TOP @k c, VectorDistance(c.{vector_field}, @emb) AS score "
+            f"SELECT TOP @k {candidate_projection(partition_key_path)}, "
+            f"VectorDistance(c.{vector_field}, @emb) AS _score "
             f"FROM c ORDER BY VectorDistance(c.{vector_field}, @emb)"
         )
         if _timing_enabled():
@@ -338,19 +382,7 @@ class CombinedRetriever:
         activity_id_note = _format_activity_id_note(activity_ids)
         reason_note = _multi_activity_reason(response_meta)
         _ck(f"vector query – done ({len(results)} results, {container.id}){activity_id_note}{reason_note}", t)
-        docs = []
-        t_reads = time.perf_counter()
-        for r in results:
-            doc = r.get("c") if isinstance(r.get("c"), dict) else None
-            if doc is None:
-                doc = {k: v for k, v in r.items() if k != "score"}
-            if not isinstance(doc, dict):
-                continue
-            score = r.get("score")
-            doc["_score"] = score if score is not None else 0
-            docs.append(doc)
-        _ck(f"vector materialize x{len(docs)} ({container.id}) – done", t_reads)
-        return docs
+        return results
     
     def _format_doc(self, doc: dict, source: str, embedding_field: str = "e") -> RetrievedChunk:
         emb_field = str(embedding_field or "e").strip()
@@ -409,7 +441,9 @@ class CombinedRetriever:
             return copy.deepcopy(cached)
 
         chunks: list[RetrievedChunk] = []
-        seen: set[tuple[str, Any]] = set()
+        seen: set[tuple[tuple[str, str, str] | tuple[str, int], tuple[str, str]]] = set()
+        references = []
+        origins = []
 
         fulltext_tasks: list[tuple[dict[str, Any], asyncio.Task]] = []
         for source in self._sources:
@@ -447,7 +481,10 @@ class CombinedRetriever:
                 if not fields:
                     continue
                 t_fulltext = _ck(f"  retrieve: fulltext/{source['id']} – start (parallel)")
-                task = asyncio.create_task(self._fulltext_search(container, fields, query, top_k))
+                task = asyncio.create_task(self._fulltext_search(
+                    container, fields, query, top_k,
+                    partition_key_path=source["partition_key_path"],
+                ))
                 fulltext_tasks.append(({"source": source, "timer": t_fulltext}, task))
 
         emb: list[float] | None = None
@@ -472,6 +509,7 @@ class CombinedRetriever:
                         emb,
                         vec_k,
                         query,
+                        partition_key_path=source["partition_key_path"],
                     )
                 )
                 vector_tasks.append(({"source": source, "timer": t_vector}, task))
@@ -481,22 +519,34 @@ class CombinedRetriever:
             docs = await task
             _ck(f"  retrieve: fulltext/{source['id']} – done ({len(docs)} results)", info["timer"])
             for doc in docs:
-                dedupe_key = (source["id"], doc.get("id"))
+                dedupe_key = (container_identity(self._containers[source["id"]]), candidate_identity(doc))
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
-                chunks.append(self._format_doc(doc, f"{source['id']}_fulltext", str(source.get("embedding_field") or "e")))
+                references.append((self._containers[source["id"]], doc))
+                origins.append((source, "fulltext"))
 
         for info, task in vector_tasks:
             source = info["source"]
             docs = await task
             _ck(f"  retrieve: vector/{source['id']} – done ({len(docs)} results)", info["timer"])
             for doc in docs:
-                dedupe_key = (source["id"], doc.get("id"))
+                dedupe_key = (container_identity(self._containers[source["id"]]), candidate_identity(doc))
                 if dedupe_key in seen:
                     continue
                 seen.add(dedupe_key)
-                chunks.append(self._format_doc(doc, f"{source['id']}_vector", str(source.get("embedding_field") or "e")))
+                references.append((self._containers[source["id"]], doc))
+                origins.append((source, "vector"))
+
+        t_fetch = _ck("fetch candidates – start")
+        documents = await fetch_candidate_results(references)
+        _ck(f"fetch candidates – done ({sum(d is not None for d in documents)} documents)", t_fetch)
+        for doc, (source, kind) in zip(documents, origins):
+            if doc is None:
+                continue
+            chunks.append(self._format_doc(
+                doc, f"{source['id']}_{kind}", str(source.get("embedding_field") or "e"),
+            ))
         
         # Diversity selection via greedy log-det maximization
         if self.k_diverse > 0 and len(chunks) > self.k_diverse:
@@ -539,6 +589,11 @@ class CombinedRetriever:
                 self._ranker_http_client, url, self._ranker_access_token,
                 query, documents, effective_k_ranker, self._ranker_batch_size, max_retries,
             )
+            if ranked_indices is None and self._ranker_fail_on_error:
+                raise RankerUnavailableError(
+                    "Semantic ranker failed and ranker.fail_on_error is set; see the "
+                    "[rerank_documents] messages above for the cause."
+                )
             if ranked_indices is not None:
                 chunks = [chunks[i] for i in ranked_indices]
                 _ck(f"  retrieve: semantic ranker – done (selected {len(chunks)} of {effective_k_ranker} requested)", t)
@@ -568,26 +623,39 @@ class CombinedRetriever:
     async def _indexed_fulltext_fields(self):
         """
         Return full-text indexed field names from the container indexing policy.
+
+        Unsupported index paths are skipped with one warning each. The result is
+        cached per container after a successful policy read.
         """
+        container_id = getattr(self._ctrproxy, "id", None)
+        if container_id in self._indexed_fields_cache:
+            return list(self._indexed_fields_cache[container_id])
         indexed_fields = []
         try:
             props = await self._ctrproxy.read()
             indexing_policy = props.get("indexingPolicy", {})
             full_text_indexes = indexing_policy.get("fullTextIndexes", [])
-
-            for index in full_text_indexes:
-                path = index.get("path", "")
-                if not path:
-                    continue
-
-                # Normalize Cosmos path (e.g. '/description/?') to SQL field path (e.g. 'description').
-                normalized = path.strip("/").replace("/?", "").replace("/*", "")
-                normalized = normalized.replace("/", ".")
-                if normalized and normalized not in indexed_fields:
-                    indexed_fields.append(normalized)
         except Exception as index_error:
             logging.warning(
                 f"fulltext_search: Could not read fullTextIndexes from container policy: {str(index_error)[:200]}"
             )
+            return indexed_fields
 
+        for index in full_text_indexes:
+            path = index.get("path", "")
+            if not path:
+                continue
+            try:
+                normalized = fulltext_field_from_index_path(path)
+            except ValueError as path_error:
+                logging.warning(
+                    f"fulltext_search: Skipping full-text index path in container "
+                    f"{container_id!r}: {path_error}"
+                )
+                continue
+            if normalized and normalized not in indexed_fields:
+                indexed_fields.append(normalized)
+
+        if container_id is not None:
+            self._indexed_fields_cache[container_id] = list(indexed_fields)
         return indexed_fields

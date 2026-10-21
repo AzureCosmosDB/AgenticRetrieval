@@ -57,6 +57,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from utils.candidates import fetch_candidate_documents, resolve_partition_key_path
+
 console = Console()
 
 # Toggled by the --verbose flag; controls extra step output and full tracebacks.
@@ -263,6 +265,18 @@ async def _build_cosmos_and_containers(dr):
     containers = {
         s["id"]: db.get_container_client(s["container_name"]) for s in sources
     }
+    try:
+        for source in sources:
+            dr._tool_use_source_partition[source["id"]] = await resolve_partition_key_path(
+                containers[source["id"]], source.get("partition_key_path"), source["id"],
+            )
+    except BaseException:
+        try:
+            await cosmos.close()
+        finally:
+            if credential is not None:
+                await credential.close()
+        raise
     return cosmos, credential, containers
 
 
@@ -302,8 +316,12 @@ class ToolUseAnswerer:
         q_obj = {"question_id": "qa_cli", "question_text": question}
         result = await dr.process_question(q_obj, self._containers)
         self.last_research = result
+        if result.get("status") == "failed":
+            raise dr.ToolUseRunError(result["error"])
         answer = result.get("answer", "") or ""
         footer: list[tuple[str, str]] = []
+        if result.get("status") == "partial":
+            footer.append(("⚠", "Partial answer: agent-turn limit reached"))
         if result.get("elapsed_seconds") is not None:
             footer.append(("⏱", f"{result['elapsed_seconds']}s"))
         if result.get("rounds") is not None:
@@ -430,19 +448,17 @@ class VectorSearchAnswerer:
         # One KNN search per source, then merge preserving per-source order.
         source_cfg = dr._tool_use_source_cfg
         source_embed = dr._tool_use_source_embed
-        merged: list[dict] = []
-        seen: set = set()
+        references = []
         for sid, container in self._containers.items():
             top_k = self._top_k_override or int(source_cfg.get(sid, {}).get("search_k", 10) or 10)
             embed_field = source_embed.get(sid, "embedding")
-            docs = await dr.tool_use_vec_search(container, emb, top_k, embed_field)
-            for doc in docs:
-                key = doc.get("id") or id(doc)
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(doc)
+            candidates = await dr.tool_use_vec_search(
+                container, emb, top_k, embed_field,
+                partition_key_path=dr._tool_use_source_partition[sid],
+            )
+            references.extend((container, candidate) for candidate in candidates)
 
+        merged = await fetch_candidate_documents(references)
         context = "\n\n".join(dr.tool_use_fmt(doc) for doc in merged)
         if not context.strip():
             answer = "I don't know — the vector search returned no documents."

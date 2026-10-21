@@ -5,14 +5,45 @@ can be imported safely from both cosmos_retriever.py and dynamic_retriever.py.
 """
 
 import asyncio
+from collections.abc import Callable
 
 import httpx
+
+
+class RankerUnavailableError(RuntimeError):
+    """Raised when ranker.fail_on_error is set and the semantic ranker cannot be used."""
+
+
+async def verify_ranker_token(
+    access_token: str | Callable[[], str], fail_on_error: bool,
+) -> str | None:
+    """Acquire a ranker token now so authentication problems surface at startup.
+
+    Returns None on success. On failure raises RankerUnavailableError when
+    fail_on_error is set; otherwise returns the problem description so the
+    caller can log it and continue without a working ranker.
+    """
+    if not callable(access_token):
+        return None
+    try:
+        await asyncio.to_thread(access_token)
+    except Exception as error:
+        message = (
+            f"Semantic ranker is unavailable: could not acquire an access token "
+            f"({type(error).__name__}: {str(error)[:300]}). Check the ranker token scope and "
+            "tenant and run 'az login'; set ranker.fail_on_error: false to continue with "
+            "unranked results instead."
+        )
+        if fail_on_error:
+            raise RankerUnavailableError(message) from error
+        return message
+    return None
 
 
 async def rerank_documents(
     http_client: httpx.AsyncClient,
     url: str,
-    access_token: str,
+    access_token: str | Callable[[], str],
     query: str,
     documents: list[str],
     top_k: int,
@@ -56,7 +87,18 @@ async def rerank_documents(
 
     for attempt in range(max_retries):
         try:
+            token = (
+                await asyncio.to_thread(access_token)
+                if callable(access_token) else access_token
+            )
+            headers["Authorization"] = f"Bearer {token}"
             resp = await http_client.post(url, headers=headers, json=body)
+            if resp.status_code in (401, 403):
+                print(
+                    f"  [rerank_documents] authorization failed (HTTP {resp.status_code}); "
+                    "check the token scope, tenant, and ranker access permissions."
+                )
+                return None
             if resp.status_code in (429, 502, 503) and attempt + 1 < max_retries:
                 await asyncio.sleep(min(2 ** attempt, 8))
                 continue

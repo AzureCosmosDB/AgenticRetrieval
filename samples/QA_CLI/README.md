@@ -24,7 +24,7 @@ question and choose how it gets answered — then run them head to head.
 
 | Strategy | What it does |
 | --- | --- |
-| `tool-use` | The agentic function-calling loop (`process_question`): the LLM decides, turn by turn, what to search and when it has enough to answer. |
+| `tool-use` | The bounded function-calling loop (`process_question`): the LLM chooses searches within an enforced budget, followed by final synthesis. |
 | `decomposed` | **Agentic Retrieval** — the decomposed multi-round RAG pipeline (`DecomposedRAGPipeline`): break the question into sub-questions, retrieve, and synthesize over several rounds. |
 | `vector` | Single-shot baseline: embeds the question, runs one Cosmos DB vector (KNN) search per source via `tool_use_vec_search`, then asks the LLM to answer from those docs. No HyDE, diversity, reranking, or looping. |
 | `compare` | Runs **all three** strategies for each question and shows the answers side by side. |
@@ -70,6 +70,34 @@ Authentication follows the same rules as the root project: Cosmos DB and the
 Azure OpenAI endpoints can use Entra ID RBAC (`use_rbac_auth: true`, requires
 `az login`) or key-based auth.
 
+### Research limits and result status
+
+```yaml
+pipeline:
+  max_search_rounds: 4
+  max_agent_turns: 50
+  rounds: 2
+```
+
+The tool-use strategy runs `initial_search` at most once, then permits up to
+`max_search_rounds` follow-up search turns; parallel queries count as one turn.
+Zero permits only initial retrieval before final synthesis. `max_agent_turns`
+is a separate positive safety cap on research/control turns, including pruning
+and retries. Pruning preserves attempted queries, source excerpts, notes and
+gap-analysis progress rather than restarting research.
+
+Either limit disables research tools and requires a final answer identifying
+unmet requirements and unverified facts. Final synthesis has at most
+`max(1, llm.max_retries)` attempts, separate from the research cap. An
+agent-turn-limit rescue answer is labeled **partial**; exhausted or invalid
+finalization is displayed as an **error**, not an empty successful answer.
+Tool-use results include `status`, `termination_reason`, and `research_progress`.
+
+`rounds: 2` applies only to **decomposed** refinement cycles after the initial
+retrieval/preliminary answer. It does not restrict tool-use research. The
+tool-use footer's round count means LLM attempts, including final synthesis,
+not decomposed cycles. The vector baseline uses neither loop budget.
+
 ## Run
 
 ```bash
@@ -107,7 +135,8 @@ vector baseline — embedding vectors are stripped to keep files readable). The
    - **decomposed** (Agentic Retrieval) — `CombinedRetriever` +
      `DecomposedRAGPipeline.run_efficient()`.
    - **vector** — `init_tool_use_clients()` for the shared embedding/LLM clients,
-     then `tool_use_embed()` → `tool_use_vec_search()` per source → one LLM call
+     then `tool_use_embed()` → lightweight `tool_use_vec_search()` per source →
+     partition-aware candidate merge and full-document fetch → one LLM call
      answering strictly from the retrieved context.
    - **compare** — runs all three for each question.
 4. Renders the answer(s) with [rich](https://github.com/Textualize/rich).

@@ -24,11 +24,17 @@ hyde: false
 # [shared] Default pipeline paradigm; CLI `--mode` overrides this value.
 pipeline:
   mode: tool-use            # {tool-use, decomposed}
+  # [tool-use only] initial_search executes once; progress survives all context pruning.
+  # At either limit, research stops and final_answer is required with unmet requirements explicit.
+  max_search_rounds: 4      # Integer >= 0; follow-up search turns, parallel queries count as one
+  max_agent_turns: 50       # Integer >= 1; includes research/control turns and retries, not final synthesis
+  # Final synthesis uses at most max(1, llm.max_retries) attempts.
+  # Results: completed, partial (agent-turn-limit rescue), or failed (explicit error, nonzero CLI exit).
   # [decomposed only] Sub-question decomposition + rounds (DecomposedRAGPipeline)
   max_sub_questions: 5
   subq_fanout_cap: 3
   subq_max_concurrency: 2
-  rounds: 2
+  rounds: 2                # Refinement cycles AFTER initial retrieval; ignored in tool-use mode
   preliminary_prefix: ""
   subquery_prefix: ""
   dataset_description: ""
@@ -107,6 +113,7 @@ ranker:
   token_scope: ""
   batch_size: 16
   max_retries: 5
+  fail_on_error: false      # true: abort at startup/run if the ranker is unusable instead of falling back to unranked results
 
 # Cosmos DB settings
 cosmos:
