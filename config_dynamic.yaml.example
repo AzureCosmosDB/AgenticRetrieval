@@ -14,7 +14,9 @@ pipeline:
   max_agent_turns: 50      # Integer >= 1; research/control-turn cap, not final-synthesis attempts
   # Either limit forces final_answer with explicit unmet requirements and unverified facts.
   # Final synthesis uses at most max(1, llm.max_retries) attempts.
-  # Empty/malformed finalization is failed, not completed; failed records cause nonzero CLI exit.
+  # Every answer is audited; missing inline context_fields or revision-only text triggers bounded repair.
+  # Audit calls are separate from research rounds; answer_validation records attempts and coverage.
+  # Invalid finalization is failed, not completed; failed records cause nonzero CLI exit.
 
 # Azure OpenAI / LLM settings
 llm:
@@ -98,6 +100,11 @@ cosmos:
       retrieval:
         search_k: 10
         fulltext_search_k: 10
+        # Opt-in: consolidated = one scalar RRF query plus one query per array.
+        # Benchmark RU/relevance first; fewer SQL requests can cost more RU.
+        fulltext_query_mode: per_field
+        fulltext_match_filter: false  # true excludes zero-match scalar candidates
+        # Explicit retrieval allowlist; additional indexed fields are not searched.
         fulltext_fields:
           - title
       indexing_policy_json: |

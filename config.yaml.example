@@ -29,6 +29,8 @@ pipeline:
   max_search_rounds: 4      # Integer >= 0; follow-up search turns, parallel queries count as one
   max_agent_turns: 50       # Integer >= 1; includes research/control turns and retries, not final synthesis
   # Final synthesis uses at most max(1, llm.max_retries) attempts.
+  # Every answer is audited; missing inline context_fields or revision-only text triggers bounded repair.
+  # Audit calls are separate from research rounds; answer_validation records attempts and coverage.
   # Results: completed, partial (agent-turn-limit rescue), or failed (explicit error, nonzero CLI exit).
   # [decomposed only] Sub-question decomposition + rounds (DecomposedRAGPipeline)
   max_sub_questions: 5
@@ -154,6 +156,11 @@ cosmos:
       retrieval:
         search_k: 10
         fulltext_search_k: 10
+        # Opt-in: consolidated = one scalar RRF query plus one query per array.
+        # Benchmark RU/relevance first; fewer SQL requests can cost more RU.
+        fulltext_query_mode: per_field
+        fulltext_match_filter: false  # true excludes zero-match scalar candidates
+        # Explicit retrieval allowlist; additional indexed fields are not searched.
         fulltext_fields:
           - title
       indexing_policy_json: |

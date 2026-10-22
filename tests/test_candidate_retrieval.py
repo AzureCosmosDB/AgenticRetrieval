@@ -23,7 +23,7 @@ from utils.candidates import (
     resolve_partition_key_path,
     validate_partition_key_path,
 )
-from utils.fulltext import fulltext_search
+from utils.fulltext import fulltext_search, fulltext_search_options
 from utils.ranker import RankerUnavailableError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,7 +205,8 @@ def load_functions(path, names, namespace):
 
 
 @pytest.mark.parametrize("source_alias", [False, True])
-def test_tool_use_fetches_only_merged_candidates_before_reranking(source_alias):
+@pytest.mark.parametrize("optimized", [False, True])
+def test_tool_use_fetches_only_merged_candidates_before_reranking(source_alias, optimized):
     container = Container()
     containers = {"products": container}
     ranker = AsyncMock(side_effect=lambda query, texts, top_k: texts[:top_k])
@@ -215,6 +216,7 @@ def test_tool_use_fetches_only_merged_candidates_before_reranking(source_alias):
         "candidate_projection": candidate_projection,
         "fetch_candidate_documents": fetch_candidate_documents,
         "fulltext_search": fulltext_search, "tool_use_rerank": ranker,
+        "fulltext_search_options": fulltext_search_options,
         "tool_use_embed": AsyncMock(return_value=[0.1]),
         "_tool_use_source_cfg": {"products": {"search_k": 2, "fulltext_search_k": 2}},
         "_tool_use_source_embed": {"products": "e"},
@@ -223,6 +225,10 @@ def test_tool_use_fetches_only_merged_candidates_before_reranking(source_alias):
         "_tool_use_rerank_mul": 1, "_tool_use_use_hyde": False,
         "_tool_use_all_embed": {"e"},
     }
+    if optimized:
+        namespace["_tool_use_source_cfg"]["products"].update({
+            "fulltext_query_mode": "consolidated", "fulltext_match_filter": True,
+        })
     if source_alias:
         alias = Container()
         for proxy in (container, alias):
@@ -245,14 +251,17 @@ def test_tool_use_fetches_only_merged_candidates_before_reranking(source_alias):
     assert ranker.await_args.args[1] == [doc["text"] for doc in result]
     assert all("SELECT TOP @k c," not in q["query"] for q in container.queries)
     assert '_score' in container.queries[0]["query"]
+    if optimized:
+        assert "WHERE (FullTextContainsAny(c.title" in container.queries[1]["query"]
     if source_alias:
         assert alias.reads == []
 
 
 @pytest.mark.parametrize("shared_container", [False, True, "separate-proxy"])
 @pytest.mark.parametrize("ranker_fail_on_error", [None, False, True])
+@pytest.mark.parametrize("optimized", [False, True])
 def test_decomposed_fetch_preserves_ft_precedence_and_vector_similarity(
-    shared_container, ranker_fail_on_error,
+    shared_container, ranker_fail_on_error, optimized,
 ):
     path = ROOT / "utils" / "cosmos_retriever.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -266,6 +275,7 @@ def test_decomposed_fetch_preserves_ft_precedence_and_vector_similarity(
     namespace = {
         "Any": Any, "asyncio": asyncio, "copy": copy, "logging": logging, "re": re,
         "fulltext_search": fulltext_search, "candidate_identity": candidate_identity,
+        "fulltext_search_options": fulltext_search_options,
         "candidate_projection": candidate_projection, "fetch_candidate_results": fetch_candidate_results,
         "container_identity": container_identity,
         "RetrievedChunk": lambda **kwargs: SimpleNamespace(**kwargs),
@@ -284,6 +294,10 @@ def test_decomposed_fetch_preserves_ft_precedence_and_vector_similarity(
         "id": "products", "fulltext_k": 2, "vector_k": 2, "embedding_field": "e",
         "partition_key_path": "/upc", "fulltext_fields": ["title", "claims[]"],
     }]
+    if optimized:
+        retriever._sources[0].update({
+            "fulltext_query_mode": "consolidated", "fulltext_match_filter": True,
+        })
     retriever._containers = {"products": container}
     if shared_container:
         retriever._sources.append({**retriever._sources[0], "id": "alias"})
@@ -295,7 +309,7 @@ def test_decomposed_fetch_preserves_ft_precedence_and_vector_similarity(
                 proxy.container_link = "dbs/db/colls/products"
             retriever._containers["alias"] = alias
     retriever._retrieve_cache = SimpleNamespace(get=Mock(return_value=None), set=Mock())
-    retriever._indexed_fulltext_fields = AsyncMock(return_value=["title", "claims[]"])
+    retriever._indexed_fulltext_fields = AsyncMock(return_value=["title", "claims[]", "not_selected"])
     retriever._source_context_fields = {}
     retriever._expected_vector_dim = 0
     retriever.k_diverse = retriever.k_ranker = 0
@@ -326,5 +340,8 @@ def test_decomposed_fetch_preserves_ft_precedence_and_vector_similarity(
     assert all(len(chunk.metadata["embedding"]) == 1536 for chunk in chunks)
     assert all("Full product" in chunk.text for chunk in chunks)
     assert all("SELECT TOP @k c," not in query["query"] for query in container.queries)
+    assert all("not_selected" not in query["query"] for query in container.queries)
+    if optimized:
+        assert any("WHERE (FullTextContainsAny(c.title" in q["query"] for q in container.queries)
     if shared_container == "separate-proxy":
         assert alias.reads == []

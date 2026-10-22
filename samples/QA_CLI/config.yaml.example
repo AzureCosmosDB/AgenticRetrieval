@@ -116,6 +116,10 @@ cosmos:
       retrieval:
         search_k: 10           # also the default top-k for the 'vector' strategy
         fulltext_search_k: 10
+        # Opt-in scalar consolidation changes ranking; benchmark RU/relevance first.
+        fulltext_query_mode: per_field  # per_field | consolidated
+        fulltext_match_filter: false   # true requires a scalar term match
+        # Explicit retrieval allowlist, independent of the full index policy.
         fulltext_fields:
           - title
       indexing_policy_json: |

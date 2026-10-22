@@ -111,9 +111,11 @@ Each entry in `cosmos.sources` is configured independently and includes:
 - `embedding_field` (document field that stores embedding vectors, e.g. `e`)
 - `documents_root`
 - `embedding_text_fields`
-- `retrieval.vector_k`
-- `retrieval.fulltext_k`
+- `retrieval.search_k` (legacy alias: `vector_k`)
+- `retrieval.fulltext_search_k` (legacy alias: `fulltext_k`)
 - `retrieval.fulltext_fields`
+- `retrieval.fulltext_query_mode` (optional: `per_field` or `consolidated`)
+- `retrieval.fulltext_match_filter` (optional boolean)
 - `indexing_policy_json`
 - `full_text_policy_json`
 
@@ -192,8 +194,8 @@ definition (`partitionKey.paths`) for every source that is searched. The
 configured `partition_key_path` is used only if the container definition cannot
 be read, and a mismatch is logged. A missing or invalid path, a container
 without a partition key, or a hierarchical partition key stops the run with a
-clear error. Full-text field lists are fused with the same
-client-side RRF as before. Candidates are then merged by container, partition
+clear error. Full-text candidate lists are fused using client-side RRF
+(with optional server-side scalar consolidation, described below). Candidates are then merged by container, partition
 key and document ID, and full documents are fetched once per unique candidate
 using partition-aware point reads with at most 16 concurrent reads per search.
 Container identity includes the account, database and container, so source aliases
@@ -210,6 +212,11 @@ Configured `fulltext_fields` that are not dotted identifiers (with an optional
 trailing `[]`) are skipped with a warning at startup in both modes. In decomposed
 mode, full-text index paths read from the container policy are validated once,
 unsupported ones are skipped with a warning, and the result is cached.
+An explicit, nonempty `fulltext_fields` list is the retrieval allowlist in both
+modes; extra indexed fields are not automatically searched. Decomposed mode checks
+the allowlist against readable index metadata and rejects missing indexes. If no
+allowlist is configured, decomposed mode discovers fields from the container policy;
+tool-use mode does not discover fields and requires an explicit list.
 
 For string-array full-text fields, configure a terminal `[]` in
 `retrieval.fulltext_fields` (for example `derived_attributes[]`) and the matching
@@ -222,6 +229,73 @@ can therefore omit relevant documents beyond that limit. Arrays and embeddings
 are unchanged. Live query diagnostics may report the array path as a potential
 index rather than an utilized index; do not assume these predicates are
 index-accelerated without checking diagnostics for the deployed service.
+
+#### Full-text query reduction and match filtering
+
+Each source accepts independent settings under `retrieval`:
+
+```yaml
+retrieval:
+  fulltext_search_k: 15
+  fulltext_query_mode: consolidated
+  fulltext_match_filter: true
+  fulltext_fields:
+    - title
+    - description
+    - claims[]
+```
+
+- **`per_field` (default):** one query per field and client-side RRF, retaining
+  legacy five-term BM25 score groups. Reduce the allowlist to reduce query fan-out
+  without removing fields from returned documents or changing container indexes.
+- **`consolidated` (opt-in):** one scalar query combining `FullTextScore` functions
+  with server-side RRF, plus one matching query per native-array field. Score calls
+  use at most 30 terms, the service limit. This reduces SQL request count but does
+  **not** guarantee lower RU or latency: Cosmos can execute multiple internal ranking
+  operations. It intentionally changes ranking, including term grouping; the combined
+  scalar list and each array list have equal weight in the final client-side RRF.
+  Compare relevance before enabling it for a workload.
+- **`fulltext_match_filter: true` (default: `false`):** scalar queries require
+  `FullTextContainsAny` on at least one searched scalar field. It uses the same
+  stopword-filtered terms as scoring, not an all-terms or phrase requirement. This
+  removes zero-match scalar candidates and can change ranking and candidate counts.
+  Native-array queries always require an element match, regardless of this setting.
+
+Omitting these options preserves legacy per-field scalar behavior. Unknown modes
+and non-boolean filter settings are errors. Query failures are logged and propagated,
+not silently converted into empty results; pending sibling queries are cancelled.
+INFO logs include per-query elapsed time, result count and RU summed from the SDK's
+response hook, including internal ranking responses. Missing RU metadata is recorded
+as unknown, not zero. Do not sum concurrent query durations as wall-clock latency.
+
+Choose field allowlists for lexical coverage that complements vector retrieval,
+not just performance on a small question set. Test real names, identifiers,
+ingredient terminology, label wording and numeric literals against the existing
+vector candidates. Repeated text is not automatically redundant: a short scalar
+field can rank useful matches that an unranked, capped array query omits. Sparse
+fields can still contain important lexical needles. Full-text matching can help
+find size or contact-number candidates, but does not enforce exact values, units,
+numeric ranges, ingredient absence or clinical suitability. Verify those requirements
+against source records; structured constraints require appropriate filters.
+
+Use the read-only benchmark to compare a baseline and candidate configuration:
+
+```powershell
+python benchmark_fulltext.py --config baseline.yaml --candidate-config candidate.yaml --questions data\products.json --repeats 2 --ranker --output out\fulltext-comparison.json
+```
+
+It rotates the order of four variants: baseline, baseline with match filtering,
+candidate, and candidate with scalar consolidation. The report checkpoints per-question
+RU, query count, wall-clock search latency and candidate identities. It does not generate
+answers or include vector search. `--ranker` measures recall against the top-k semantic
+ranking of the pooled candidate sets using the configured ranker; failure to obtain that
+ranking stops the benchmark. This is a relevance **proxy**, not human-labeled recall.
+Baseline overlap is also reported and is not a quality score. Optional repeatable
+`--identity-upc` probes use exact indexed UPC lookups as identity-recall ground truth
+(requires `/upc` partitioning); an additional negative probe checks zero-match behavior.
+Question, identity and negative results are summarized separately. Neither identity
+recall nor the semantic proxy establishes answer correctness or clinical suitability.
+No index-policy changes are required for query consolidation/filtering.
 
 Tool-use mode atomically checkpoints full answers and per-question
 `elapsed_seconds` to its results JSON after every completed question, preserving
@@ -272,27 +346,144 @@ source-backed finding excerpts, assistant notes and the latest gap analysis.
 Notes and gaps are provisional, not additional source evidence. Compacted
 context includes this progress plus retained documents, rather than restarting
 the workflow. When context is too small for all finding excerpts, omissions
-are logged; the complete ledger remains in the saved result. Full retrieved
-documents remain cached for explicit pruning during the question.
+are logged. Findings (both document IDs and excerpts) remain internal to research
+and context compaction and are omitted from saved `research_progress`.
+Full retrieved documents remain cached for explicit pruning during the question.
 
 At either limit the runtime disables research tools and requires `final_answer`,
 with instructions to identify unmet requirements and unverified facts. Final
 synthesis has at most `llm.max_retries` attempts (at least one), separate from
-the research-turn cap. Empty or malformed answers are not accepted as success.
+the research-turn cap. Invalid normal answers also enter this bounded synthesis
+phase without restarting research. Empty, malformed or revision-only responses
+are not accepted as success.
+
+Every proposed tool-use answer, including plain model responses and forced
+synthesis, passes through a final-answer audit before acceptance. The LLM audit
+checks that it is an actual answer rather than a progress/formatting message and
+enumerates every distinct named source item, including alternatives and exclusions.
+When `context_fields` are configured, each item's introduction must contain those
+field/value pairs inline. Runtime checks require exact quotations from the answer
+and verify that all identifier values occur together in a retrieved record,
+preserving string identifiers and leading zeros. A document ID alone or an
+"identifier not verified" placeholder does not satisfy configured field coverage.
+If an item's identifiers cannot be verified, synthesis must omit that named item
+and explain the unmet requirement instead of inventing identifiers.
+
+Missing coverage, malformed audits and audit-service failures cannot bypass the
+gate. Exhausted repair attempts produce an explicitly failed record. The semantic
+coverage audit is model-assisted, not a proof of factual accuracy; the exact-value
+and same-record identity checks are deterministic. Neither validates every product
+claim, medical suitability or fulfillment of every user constraint. Evidence-limited
+answers with explicit gaps may still pass.
+
+Validation adds LLM calls, timed as `LLM answer validation`. Saved
+`answer_validation` includes status, attempts, rejections, error history and the
+verified item quotes/identifiers with matching source document IDs.
 Tool-use results include `status`, `termination_reason` and `research_progress`:
 
 | Status | Meaning |
 | --- | --- |
-| `completed` | A nonempty answer was produced, either normally or through forced synthesis. `research_budget_exhausted` identifies planned budget-based finalization; it does not mean every requirement was verified. |
-| `partial` | The agent-turn safety cap was reached and forced synthesis produced an answer (`termination_reason: agent_turn_limit`). |
+| `completed` | An answer passed final-answer validation, either normally or through forced synthesis. `research_budget_exhausted` identifies planned budget-based finalization; it does not mean every requirement was verified. |
+| `partial` | The agent-turn safety cap was reached and forced synthesis produced a validated answer (`termination_reason: agent_turn_limit`). |
 | `failed` | No valid answer could be produced, for example `finalization_failed` or `llm_error`. The record includes an explicit `error`; an empty answer is never marked successful. |
 
 Failed records are checkpointed and processing continues to the remaining
 questions; the CLI exits nonzero after saving the run if any records failed.
 Partial answers are explicitly marked but do not alone cause a nonzero exit.
 The `rounds` result field counts agent and final-synthesis LLM attempts, not
-decomposed refinement cycles. No limit can guarantee that every user requirement
-is supported by the available corpus.
+decomposed refinement cycles or answer-audit calls. Audit attempts are counted
+separately in `answer_validation.attempts`; include them when comparing total LLM
+work or performance. No limit can guarantee that every user requirement is
+supported by the available corpus.
+
+### Tool-use results JSON format
+
+Tool-use writes a JSON array to
+`<output_root>/standard/results_<YYYYMMDD_HHMMSS>.json`, with one object per
+processed question. It atomically checkpoints the array after each question;
+an interrupted run may therefore contain fewer records than the input.
+This format describes tool-use output, not decomposed-mode output.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `question_id` | string | Input question identifier (empty if omitted). |
+| `query` | string | Original input `question_text`. |
+| `answer` | string | Accepted final answer, or empty when finalization fails. |
+| `ground_truth` | string | Input reference `answer`, or empty if none was supplied. |
+| `model` | string | Configured LLM deployment/model name. |
+| `rounds` | integer | Research/control and final-synthesis LLM attempts; excludes answer-audit calls. |
+| `elapsed_seconds` | number | Wall-clock question duration, including validation and repairs, excluding run startup. |
+| `tool_calls` | object | Counts for `initial_search`, `search`, `prune`, `find_information_gaps` and `final_answer`. Search calls count individual queries, unlike follow-up search rounds. `prune` also includes automatic pruning; `final_answer` includes rejected submissions. |
+| `status` | string | `completed`, `partial` or `failed`, as defined above. |
+| `termination_reason` | string | Exit path, such as `final_answer`, `model_answer`, `research_budget_exhausted`, `agent_turn_limit`, `invalid_model_answer`, `invalid_final_answer`, `empty_model_answer`, `context_limit`, `finalization_failed` or `llm_error`. A repair-triggering reason can accompany a successfully repaired answer; inspect `status`. |
+| `research_progress` | object | Research ledger described below. |
+| `answer_validation` | object | Final-answer audit and identifier checks described below. |
+| `error` | string, optional | Failure details; present on failed records. |
+
+`research_progress` contains:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `initial_search_completed` | boolean | Whether initial retrieval completed. |
+| `search_rounds` | integer | Follow-up turns requesting searches; parallel queries count as one turn. |
+| `attempted_queries` | array of strings | Initial and follow-up query texts, in recorded execution order. |
+| `unresolved_gaps` | array of strings | Latest gap-analysis output; provisional, not independently verified evidence. |
+| `notes` | array of strings | Assistant messages retained during research; provisional, not source evidence. |
+
+`answer_validation` contains:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `status` | string | `not_run`, `failed` or `passed`. Successful answers must have `passed`. |
+| `attempts` | integer | Audit attempts, including unsuccessful requests. |
+| `rejections` | integer | Rejected/unsuccessful audits, including audit-service errors. |
+| `errors` | array of strings | Audit rejection/error history; may remain nonempty after successful repair. |
+| `items` | array of objects | Distinct named source items identified by the accepted audit, including alternatives and exclusions. May be empty for an evidence-limited answer with no named items. |
+
+Each `answer_validation.items` entry contains:
+
+- `quote`: an exact contiguous excerpt **from the answer**, including the item's
+  inline identifiers; it is not a quotation from a source document.
+- `context_fields`: configured field names mapped to exact identifier values
+  **as strings**, preserving leading zeros.
+- `source_docids`: retrieved record IDs containing all those identifier values
+  together. Multiple complementary records may match the same item. Without
+  configured context fields, this array is empty.
+
+For example, the nested structures can look like:
+
+```json
+{
+  "research_progress": {
+    "initial_search_completed": true,
+    "search_rounds": 1,
+    "attempted_queries": ["original question", "targeted follow-up"],
+    "unresolved_gaps": ["Current stock is unverified."],
+    "notes": []
+  },
+  "answer_validation": {
+    "status": "passed",
+    "attempts": 1,
+    "rejections": 0,
+    "errors": [],
+    "items": [
+      {
+        "quote": "Example cream (upc: 001234567890; product_id: 7)",
+        "context_fields": {"upc": "001234567890", "product_id": "7"},
+        "source_docids": ["doc-one", "doc-two"]
+      }
+    ]
+  }
+}
+```
+
+The internal retrieval findings are not serialized. Validation items describe
+named items in the answer, not every retrieved candidate.
+`source_docids` establishes identifier traceability, **not claim-level citation
+support** or verification of every statement about the item.
+Older output files may contain `research_progress.findings` as an object mapping
+IDs to truncated document excerpts or as an ID-only array; newly generated results
+omit the field entirely.
 
 Before running retrieval, prepare your questions file.
 

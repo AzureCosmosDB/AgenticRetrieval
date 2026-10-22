@@ -9,7 +9,7 @@ from utils.candidates import (
     fetch_candidate_results,
     resolve_partition_key_path,
 )
-from utils.cosmos_retriever import CombinedRetriever
+from utils.cosmos_retriever import CombinedRetriever, _get_source_config
 from utils.ranker import RankerUnavailableError, verify_ranker_token
 
 
@@ -114,6 +114,32 @@ def test_failed_policy_read_is_not_cached():
     container.error = None
     container.properties = {"indexingPolicy": {"fullTextIndexes": [{"path": "/title/?"}]}}
     assert asyncio.run(retriever._indexed_fulltext_fields()) == ["title"]
+
+
+def test_fulltext_query_options_survive_both_source_normalizers():
+    raw = {"cosmos": {"sources": [{
+        "id": "products", "container_name": "products",
+        "retrieval": {
+            "fulltext_fields": ["title", "claims[]"], "fulltext_search_k": 3,
+            "fulltext_query_mode": "consolidated", "fulltext_match_filter": True,
+        },
+    }]}}
+    configured = _get_source_config(raw)
+    retriever = object.__new__(CombinedRetriever)
+    normalized = retriever._normalize_sources(configured, None)
+    assert normalized[0]["fulltext_query_mode"] == "consolidated"
+    assert normalized[0]["fulltext_match_filter"] is True
+    assert normalized[0]["fulltext_fields"] == ["title", "claims[]"]
+
+
+@pytest.mark.parametrize("mode,match_filter", [("invalid", True), ("per_field", "false")])
+def test_invalid_fulltext_options_are_rejected_during_source_configuration(mode, match_filter):
+    with pytest.raises(ValueError, match="retrieval.fulltext_"):
+        _get_source_config({"cosmos": {"sources": [{
+            "container_name": "products", "retrieval": {
+                "fulltext_query_mode": mode, "fulltext_match_filter": match_filter,
+            },
+        }]}})
 
 
 def test_ranker_token_failure_respects_fail_on_error():

@@ -30,10 +30,26 @@ def response(*calls, content=None):
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
+def test_research_snapshot_omits_findings_without_changing_internal_findings():
+    progress = dr._ToolUseResearchProgress(findings={
+        "doc-one": "First document excerpt.", "doc-two": "Second document excerpt.",
+    })
+    saved = progress.snapshot()
+    assert "findings" not in json.loads(json.dumps(saved))
+    compacted = progress.snapshot(include_document_text=True)
+    assert compacted["findings"] == {
+        "doc-one": "First document excerpt.", "doc-two": "Second document excerpt.",
+    }
+    compacted["findings"].pop("doc-one")
+    assert progress.findings["doc-one"] == "First document excerpt."
+
+
 @pytest.fixture
 def agent(monkeypatch):
     requests = []
     scripted = []
+    validation_requests = []
+    audits = []
     monkeypatch.setattr(dr, "_tool_use_query_template", "Original question: {question}. initial_search first.")
     monkeypatch.setattr(dr, "_tool_use_context_fields", [])
     monkeypatch.setattr(dr, "_tool_use_max_search_rounds", 2)
@@ -46,6 +62,15 @@ def agent(monkeypatch):
     })
 
     async def create(**kwargs):
+        choice = kwargs.get("tool_choice")
+        if isinstance(choice, dict) and choice.get("function", {}).get("name") == "audit_answer":
+            validation_requests.append(copy.deepcopy(kwargs))
+            audit = audits.pop(0) if audits else {"substantive": True, "issues": [], "items": []}
+            if isinstance(audit, Exception):
+                raise audit
+            if isinstance(audit, SimpleNamespace):
+                return audit
+            return response(("audit_answer", audit))
         requests.append(copy.deepcopy(kwargs))
         assert scripted, "Unexpected extra LLM request"
         item = scripted.pop(0)
@@ -54,7 +79,10 @@ def agent(monkeypatch):
         return item
 
     async def search(query, containers):
-        return json.dumps([{"docid": query, "text": f"Verified source finding for {query}; upc: 001."}])
+        return json.dumps([{
+            "docid": query,
+            "text": f"Verified source finding for {query}.\nupc: 001\nproduct_id: 7",
+        }])
 
     async def prune(docids, containers, cache):
         return "\n".join(cache[docid] for docid in docids if docid in cache)
@@ -73,9 +101,205 @@ def agent(monkeypatch):
             "question_id": "q1", "question_text": "original",
         }, {}))
         assert not scripted
+        assert not audits
         return result
 
-    return SimpleNamespace(run=run, requests=requests, search=search_mock)
+    return SimpleNamespace(
+        run=run, requests=requests, search=search_mock,
+        audits=audits, validation_requests=validation_requests,
+    )
+
+
+@pytest.mark.parametrize("path", ["model", "tool", "forced"])
+def test_revision_only_responses_require_validated_synthesis(agent, monkeypatch, path):
+    revision = (
+        "Research completed, but the final answer needs a revision to include "
+        "the exact UPC and product ID for every product mentioned."
+    )
+    if path == "forced":
+        monkeypatch.setattr(dr, "_tool_use_max_search_rounds", 0)
+    agent.audits.extend([
+        {"substantive": False, "issues": ["Revision instruction, not an answer."], "items": []},
+        {"substantive": True, "issues": [], "items": []},
+    ])
+    invalid = response(content=revision) if path == "model" else response(
+        ("final_answer", {"answer": revision}),
+    )
+    result = agent.run(
+        response(("initial_search", {})), invalid,
+        response(("final_answer", {"answer": "Available evidence; retailer stock remains unverified."})),
+    )
+    assert result["status"] == "completed"
+    assert result["answer"] != revision
+    assert result["answer_validation"]["status"] == "passed"
+    assert result["answer_validation"]["attempts"] == 2
+    assert result["answer_validation"]["rejections"] == 1
+    assert result["tool_calls"]["initial_search"] == 1
+
+
+@pytest.mark.parametrize("path", ["model", "tool", "forced"])
+def test_incomplete_inline_identifiers_are_repaired_on_every_exit_path(agent, monkeypatch, path):
+    monkeypatch.setattr(dr, "_tool_use_context_fields", ["upc", "product_id"])
+    if path == "forced":
+        monkeypatch.setattr(dr, "_tool_use_max_search_rounds", 0)
+    incomplete = "Item (upc: 001). Stock is unverified."
+    complete = "Item (upc: 001; product_id: 7). Stock is unverified."
+    agent.audits.extend([
+        {"substantive": True, "issues": [], "items": [{
+            "quote": "Item (upc: 001)", "context_fields": {"upc": "001"},
+        }]},
+        {"substantive": True, "issues": [], "items": [{
+            "quote": "Item (upc: 001; product_id: 7)",
+            "context_fields": {"upc": "001", "product_id": "7"},
+        }]},
+    ])
+    invalid = response(content=incomplete) if path == "model" else response(
+        ("final_answer", {"answer": incomplete}),
+    )
+    result = agent.run(
+        response(("initial_search", {})), invalid,
+        response(("final_answer", {"answer": complete})),
+    )
+    assert result["answer"] == complete
+    assert result["answer_validation"]["rejections"] == 1
+    assert result["answer_validation"]["items"][0]["source_docids"] == ["original"]
+    assert agent.search.await_count == 1
+    final_tool = next(
+        t for t in agent.requests[1]["tools"] if t["function"]["name"] == "final_answer"
+    )
+    assert "upc, product_id" in final_tool["function"]["description"]
+    assert "revision request" in final_tool["function"]["description"]
+
+
+def test_repeated_revision_only_responses_fail_explicitly_without_more_search(agent):
+    agent.audits.extend([
+        {"substantive": False, "issues": ["Formatting revision only."], "items": []}
+        for _ in range(3)
+    ])
+    invalid = response(("final_answer", {"answer": "Please revise the final answer."}))
+    result = agent.run(response(("initial_search", {})), invalid, invalid, invalid)
+    assert result["status"] == "failed"
+    assert result["termination_reason"] == "finalization_failed"
+    assert result["answer"] == ""
+    assert result["error"]
+    assert result["answer_validation"]["status"] == "failed"
+    assert result["answer_validation"]["attempts"] == 3
+    assert agent.search.await_count == 1
+    for request in agent.requests[2:]:
+        pending = set()
+        for message in request["messages"]:
+            pending.update(call["id"] for call in message.get("tool_calls", []))
+            if message["role"] == "tool":
+                pending.discard(message["tool_call_id"])
+        assert not pending
+
+
+def test_validation_service_failure_cannot_become_success(agent):
+    failure = openai.APIConnectionError(
+        request=httpx.Request("POST", "https://example.invalid"),
+    )
+    agent.audits.extend([failure, failure, failure])
+    candidate = response(("final_answer", {"answer": "Supported answer."}))
+    result = agent.run(response(("initial_search", {})), candidate, candidate, candidate)
+    assert result["status"] == "failed"
+    assert result["answer_validation"]["status"] == "failed"
+    assert "Connection" in result["error"]
+
+
+def test_missing_audit_tool_call_requires_repair(agent):
+    agent.audits.append(response(content="The answer looks fine."))
+    candidate = response(("final_answer", {"answer": "Supported facts; stock remains unverified."}))
+    result = agent.run(response(("initial_search", {})), candidate, candidate)
+    assert result["answer_validation"]["status"] == "passed"
+    assert result["answer_validation"]["rejections"] == 1
+
+
+def test_identifier_evidence_survives_pruning(agent, monkeypatch):
+    monkeypatch.setattr(dr, "_tool_use_context_fields", ["upc", "product_id"])
+    answer = "Item (upc: 001; product_id: 7). Stock remains unverified."
+    agent.audits.append({
+        "substantive": True, "issues": [], "items": [{
+            "quote": "Item (upc: 001; product_id: 7)",
+            "context_fields": {"upc": "001", "product_id": "7"},
+        }],
+    })
+    result = agent.run(
+        response(("initial_search", {})),
+        response(("prune", {"docids": []})),
+        response(("final_answer", {"answer": answer})),
+    )
+    assert result["answer"] == answer
+    assert result["answer_validation"]["items"][0]["source_docids"] == ["original"]
+
+
+@pytest.mark.parametrize("case", [
+    "missing_boolean", "invalid_issues", "missing_items", "invented_quote",
+    "missing_field", "invented_value", "split_record_values", "leading_zero_loss",
+    "not_inline", "omitted_items", "numeric_value",
+])
+def test_answer_audit_rejects_invalid_or_ungrounded_identity_coverage(case):
+    answer = "Item (upc: 001; product_id: 7)."
+    item = {
+        "quote": "Item (upc: 001; product_id: 7)",
+        "context_fields": {"upc": "001", "product_id": "7"},
+    }
+    audit = {"substantive": True, "issues": [], "items": [item]}
+    documents = {"one": "upc: 001\nproduct_id: 7"}
+    if case == "missing_boolean":
+        del audit["substantive"]
+    elif case == "invalid_issues":
+        audit["issues"] = "none"
+    elif case == "missing_items":
+        del audit["items"]
+    elif case == "invented_quote":
+        item["quote"] = "Another Item (upc: 001; product_id: 7)"
+    elif case == "missing_field":
+        del item["context_fields"]["product_id"]
+    elif case == "invented_value":
+        documents = {"one": "upc: 001\nproduct_id: 8"}
+    elif case == "split_record_values":
+        documents = {"one": "upc: 001\nproduct_id: 8", "two": "upc: 002\nproduct_id: 7"}
+    elif case == "leading_zero_loss":
+        answer = item["quote"] = "Item (upc: 1; product_id: 7)"
+        item["context_fields"]["upc"] = "1"
+    elif case == "not_inline":
+        item["quote"] = "Item"
+    elif case == "omitted_items":
+        audit["items"] = []
+    else:
+        item["context_fields"]["product_id"] = 7
+    with pytest.raises(ValueError):
+        dr._validate_tool_use_answer_audit(answer, audit, ["upc", "product_id"], documents)
+
+
+def test_answer_audit_supports_non_product_fields_markdown_and_zero_values(monkeypatch):
+    monkeypatch.setattr(dr, "_tool_use_context_fields", ["asset_ref", "region_code"])
+    text = dr.tool_use_fmt({"id": "one", "asset_ref": "US-001", "region_code": 0})
+    answer = "**Asset** (**asset_ref:** `US-001`; **region_code:** 0)."
+    items = dr._validate_tool_use_answer_audit(
+        answer, {"substantive": True, "issues": [], "items": [{
+            "quote": answer, "context_fields": {"asset_ref": "US-001", "region_code": "0"},
+        }]}, ["asset_ref", "region_code"], {"one": text},
+    )
+    assert items[0]["source_docids"] == ["one"]
+
+
+@pytest.mark.parametrize("value", ["A__001", "A*001", "A`001"])
+def test_answer_audit_preserves_literal_markdown_characters_in_identifiers(value):
+    answer = f"Item (asset_ref: {value})."
+    items = dr._validate_tool_use_answer_audit(
+        answer, {"substantive": True, "issues": [], "items": [{
+            "quote": answer, "context_fields": {"asset_ref": value},
+        }]}, ["asset_ref"], {"one": f"asset_ref: {value}"},
+    )
+    assert items[0]["context_fields"]["asset_ref"] == value
+
+
+def test_evidence_limited_answer_can_pass_without_inventing_an_identified_item():
+    assert dr._validate_tool_use_answer_audit(
+        "No verified match was found; retailer availability and allergen status remain unverified.",
+        {"substantive": True, "issues": [], "items": []}, ["upc", "product_id"], {},
+    ) == []
 
 
 @pytest.mark.parametrize("budget", [0, 1, 2])
@@ -159,8 +383,7 @@ def test_pruning_preserves_queries_findings_notes_and_gaps(agent, monkeypatch, p
     state = result["research_progress"]
     assert state["initial_search_completed"] is True
     assert state["attempted_queries"] == ["original", "targeted", "remaining gap"]
-    assert state["findings"]["original"].startswith("Verified source finding")
-    assert state["findings"]["targeted"].startswith("Verified source finding")
+    assert "findings" not in state
     assert "ingredients are documented" in " ".join(state["notes"])
     assert "retailer stock" in state["unresolved_gaps"][0]
     compacted = [
@@ -222,6 +445,13 @@ def test_empty_model_answer_triggers_final_synthesis(agent):
 def test_forced_synthesis_includes_configured_traceability_fields(agent, monkeypatch):
     monkeypatch.setattr(dr, "_tool_use_context_fields", ["upc", "product_id"])
     monkeypatch.setattr(dr, "_tool_use_max_search_rounds", 0)
+    agent.audits.append({
+        "substantive": True, "issues": [],
+        "items": [{
+            "quote": "Item (upc: 001; product_id: 7)",
+            "context_fields": {"upc": "001", "product_id": "7"},
+        }],
+    })
     agent.run(
         response(("initial_search", {})),
         response(("final_answer", {"answer": "Item (upc: 001; product_id: 7). Unmet: stock."})),
@@ -261,7 +491,7 @@ def test_compaction_preserves_complete_ledger_when_context_excerpts_must_be_omit
         response(("initial_search", {})),
         response(("final_answer", {"answer": "Available facts; remaining requirements unverified."})),
     )
-    assert len(result["research_progress"]["findings"]) == 6
+    assert "findings" not in result["research_progress"]
     assert "source excerpts omitted" in capsys.readouterr().out
     assert dr.count_tokens(agent.requests[-1]["messages"]) < 700
 
@@ -278,5 +508,5 @@ def test_invalid_prune_arguments_are_reported_without_losing_progress(agent, mix
     )
     assert result["tool_calls"]["initial_search"] == 1
     assert result["tool_calls"]["prune"] == 0
-    assert result["research_progress"]["findings"]["original"]
+    assert "findings" not in result["research_progress"]
     assert agent.search.await_count == 1

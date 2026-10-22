@@ -26,7 +26,7 @@ from dynamic_retriever import (
     RetrievedChunk,
 )
 from greedy_log_det import greedy_log_det_select
-from utils.fulltext import fulltext_field_from_index_path, is_fulltext_field_path
+from utils.fulltext import fulltext_field_from_index_path, fulltext_search_options, is_fulltext_field_path
 from utils.candidates import (
     candidate_identity,
     candidate_projection,
@@ -112,6 +112,7 @@ def _get_source_config(config: dict[str, Any]) -> list[dict[str, Any]]:
                 "vector_k": vector_k,
                 "fulltext_k": fulltext_k,
                 "fulltext_fields": _as_list_of_strings(retrieval_cfg.get("fulltext_fields")),
+                **fulltext_search_options(retrieval_cfg),
             }
         )
     return normalized_sources
@@ -238,6 +239,7 @@ class CombinedRetriever:
                     "vector_k": max(0, vector_k),
                     "fulltext_k": max(0, fulltext_k),
                     "fulltext_fields": fulltext_fields,
+                    **fulltext_search_options(source),
                 }
             )
         return normalized
@@ -296,6 +298,7 @@ class CombinedRetriever:
     async def _fulltext_search(
         self, container, fields: list[str], query: str, top_k: int, *,
         partition_key_path: str,
+        fulltext_query_mode: str = "per_field", fulltext_match_filter: bool = False,
     ) -> list[dict]:
         if top_k <= 0 or not fields:
             return []
@@ -313,6 +316,7 @@ class CombinedRetriever:
         items = await fulltext_search(
             container, fields, query, top_k, log_fn=_log_fulltext_sql,
             partition_key_path=partition_key_path,
+            fulltext_query_mode=fulltext_query_mode, fulltext_match_filter=fulltext_match_filter,
         )
         _ck(f"fulltext – done ({len(items)} results, {container.id})", t)
         return items
@@ -457,22 +461,25 @@ class CombinedRetriever:
             # Try configured full-text search fields
             fulltext_search_fields = []
 
-            # First attempt: discover actual full-text indexed fields from container indexing policy.
-            # Fallback to config-based values if this fails or yields nothing.
+            # Explicit fields are the retrieval allowlist; the policy can contain
+            # additional indexes not selected for this workload.
             self._ctrproxy = container
             indexed_fields = await self._indexed_fulltext_fields()
-            if indexed_fields:
+            configured = source.get("fulltext_fields") or []
+            if configured:
+                if indexed_fields:
+                    missing = [field for field in configured if field not in indexed_fields]
+                    if missing:
+                        raise ValueError(
+                            f"Source {source['id']!r}: configured full-text fields are not indexed: {missing}"
+                        )
+                fulltext_search_fields = [configured]
+            elif indexed_fields:
                 # Keep existing loop contract where each item is a field-combination list.
                 fulltext_search_fields = [indexed_fields]
                 logging.info(
                     f"_fallback_text_search: Loaded {len(indexed_fields)} indexed full-text fields from container policy"
                 )
-
-            # Fallback: load from config (e.g., .env or config service)
-            if not fulltext_search_fields:
-                configured = source.get("fulltext_fields") or []
-                if configured:
-                    fulltext_search_fields = [configured]
 
             if not fulltext_search_fields:
                 continue
@@ -484,6 +491,7 @@ class CombinedRetriever:
                 task = asyncio.create_task(self._fulltext_search(
                     container, fields, query, top_k,
                     partition_key_path=source["partition_key_path"],
+                    **fulltext_search_options(source),
                 ))
                 fulltext_tasks.append(({"source": source, "timer": t_fulltext}, task))
 
