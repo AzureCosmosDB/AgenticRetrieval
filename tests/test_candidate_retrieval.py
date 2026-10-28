@@ -224,6 +224,7 @@ def test_tool_use_fetches_only_merged_candidates_before_reranking(source_alias, 
         "_tool_use_source_partition": {"products": "/upc"},
         "_tool_use_rerank_mul": 1, "_tool_use_use_hyde": False,
         "_tool_use_all_embed": {"e"},
+        "_tool_use_context_fields": [],
     }
     if optimized:
         namespace["_tool_use_source_cfg"]["products"].update({

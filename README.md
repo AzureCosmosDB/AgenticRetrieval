@@ -342,13 +342,22 @@ be positive. Defaults are 4 and 50.
 
 Explicit pruning, automatic pruning and context-overflow recovery retain an
 independent progress ledger: completed initial retrieval, attempted queries,
-source-backed finding excerpts, assistant notes and the latest gap analysis.
+complete formatted source findings, assistant notes and the latest gap analysis.
 Notes and gaps are provisional, not additional source evidence. Compacted
 context includes this progress plus retained documents, rather than restarting
-the workflow. When context is too small for all finding excerpts, omissions
-are logged. Findings (both document IDs and excerpts) remain internal to research
+the workflow. Findings have no fixed per-document character cutoff. During
+compaction, the progress summary targets 40% of `llm.context_limit`, omitting
+oldest findings first if needed. Retained evidence uses the remaining budget
+up to a 75% total target and may be token-truncated; omissions and truncation
+are logged. These limits reserve headroom for subsequent turns and synthesis.
+Findings (both document IDs and text) remain internal to research
 and context compaction and are omitted from saved `research_progress`.
 Full retrieved documents remain cached for explicit pruning during the question.
+Configured `context_fields` appear first in tool-use document text, preserving
+their configured order and string values (including leading zeros). This reduces
+identifier loss when evidence is truncated, but cannot preserve a document that
+is omitted entirely. Embedding input and full-text field lists do not control
+which ordinary fields are displayed in tool-use results.
 
 At either limit the runtime disables research tools and requires `final_answer`,
 with instructions to identify unmet requirements and unverified facts. Final

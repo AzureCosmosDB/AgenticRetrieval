@@ -1669,9 +1669,12 @@ async def tool_use_rerank(query: str, docs: list[str], top_k: int) -> list[str]:
 
 def tool_use_fmt(doc: dict) -> str:
     ex = {"_rid", "_self", "_etag", "_attachments", "_ts", "_score", "e"} | _tool_use_all_embed
+    context_fields = set(_tool_use_context_fields)
+    ordered_keys = dict.fromkeys([*_tool_use_context_fields, *doc])
     return "\n".join(
-        f"{k}: {v}" for k, v in doc.items()
-        if k not in ex and (v or (k in _tool_use_context_fields and v is not None))
+        f"{k}: {doc[k]}" for k in ordered_keys
+        if k in doc and k not in ex
+        and (doc[k] or (k in context_fields and doc[k] is not None))
     )
 
 
@@ -1899,7 +1902,7 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                 "role": "user",
                 "content": (
                     "Research progress survived context compaction. Do not restart research or "
-                    "repeat initial_search. Findings below are source excerpts, not complete "
+                    "repeat initial_search. Findings below contain complete formatted source "
                     "documents; notes and gaps are provisional, not independent evidence. "
                     f"Follow-up search rounds used: {progress.search_rounds}/"
                     f"{_tool_use_max_search_rounds}.\n"
@@ -1920,8 +1923,8 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
             _log_line(f"Question {qid}: truncated retained evidence to fit context_limit", kind="warn")
         if omitted:
             _log_line(
-                f"Question {qid}: {omitted} source excerpts omitted from compacted context; "
-                "the complete progress ledger remains in the result.",
+                f"Question {qid}: {omitted} source documents omitted from the compacted progress "
+                "summary; complete documents remain cached for pruning and answer validation.",
                 kind="warn",
             )
         msgs[:] = [initial_msg, resume, {"role": "user", "content": evidence}]
@@ -2176,7 +2179,7 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                     if not isinstance(hit, dict) or not isinstance(hit.get("docid"), str) or not isinstance(hit.get("text"), str):
                         raise ToolUseRunError("Search returned invalid document identity or text")
                     doc_cache[hit["docid"]] = hit["text"]
-                    progress.findings[hit["docid"]] = hit["text"][:512]
+                    progress.findings[hit["docid"]] = hit["text"]
             return t, out, False
 
         if "initial_search" in call_names and len(call_names) > 1:

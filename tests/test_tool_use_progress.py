@@ -410,6 +410,37 @@ def test_invalid_normal_final_answer_is_not_returned_as_success(agent, arguments
     assert result["tool_calls"]["final_answer"] == 2
 
 
+@pytest.mark.parametrize("word_count,omitted", [(100, 0), (1800, 1)])
+def test_compaction_uses_complete_findings_within_token_budget(agent, monkeypatch, word_count, omitted):
+    monkeypatch.setattr(dr, "_tool_use_context_fields", ["upc", "product_id"])
+    text = dr.tool_use_fmt({
+        "description": "evidence " * word_count + "Important fact beyond character 512.",
+        "upc": "001234567890",
+        "product_id": 0,
+    })
+    agent.search.side_effect = None
+    agent.search.return_value = json.dumps([{"docid": "original", "text": text}])
+
+    result = agent.run(
+        response(("initial_search", {})),
+        response(("prune", {"docids": ["original"]})),
+        response(("final_answer", {"answer": "Evidence available; retailer stock is unverified."})),
+    )
+
+    messages = agent.requests[-1]["messages"]
+    resume = next(
+        message["content"] for message in messages
+        if "Research progress survived" in (message.get("content") or "")
+    )
+    summary = json.loads(resume.split("\n", 1)[1])
+    assert summary["findings_omitted_from_context"] == omitted
+    assert summary["findings"] == ({} if omitted else {"original": text})
+    assert any(message.get("content") == text for message in messages)
+    assert dr.count_tokens(messages[:3]) <= dr._tool_use_context_limit * 0.75
+    assert result["status"] == "completed"
+    assert "findings" not in result["research_progress"]
+
+
 @pytest.mark.parametrize("failure", ["empty", "malformed", "missing_call", "http"])
 def test_failed_forced_finalization_is_explicit_and_bounded(agent, monkeypatch, failure):
     monkeypatch.setattr(dr, "_tool_use_max_search_rounds", 0)
@@ -478,7 +509,7 @@ def test_research_budget_defaults_and_zero_followup_rounds():
     assert dr._tool_use_research_limits({"max_search_rounds": 0, "max_agent_turns": 1}) == (0, 1)
 
 
-def test_compaction_preserves_complete_ledger_when_context_excerpts_must_be_omitted(
+def test_compaction_preserves_complete_ledger_when_context_findings_must_be_omitted(
     agent, monkeypatch, capsys,
 ):
     monkeypatch.setattr(dr, "_tool_use_context_limit", 700)
@@ -492,7 +523,7 @@ def test_compaction_preserves_complete_ledger_when_context_excerpts_must_be_omit
         response(("final_answer", {"answer": "Available facts; remaining requirements unverified."})),
     )
     assert "findings" not in result["research_progress"]
-    assert "source excerpts omitted" in capsys.readouterr().out
+    assert "source documents omitted" in capsys.readouterr().out
     assert dr.count_tokens(agent.requests[-1]["messages"]) < 700
 
 
