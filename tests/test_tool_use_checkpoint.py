@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import pytest
+from dynamic_retriever import _nonempty_question
 from utils.ranker import RankerUnavailableError
 
 
@@ -151,6 +152,7 @@ def test_decomposed_fatal_ranker_error_cancels_work_and_preserves_completed_trac
         "LLMClient": Mock(return_value=llm),
         "DecomposedRAGPipeline": Mock(return_value=pipeline),
         "load_questions": lambda path: {"questions": questions},
+        "_nonempty_question": _nonempty_question,
         "CONFIG": {
             "retrieval": {"k_diverse": 0, "eta": 0, "rescale_power": 0},
             "execution": {"max_questions": None, "max_workers": 3},

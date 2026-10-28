@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Callable
+import contextlib
 import copy
 import contextvars
 import datetime
@@ -1343,6 +1344,10 @@ class ToolUseRunError(RuntimeError):
     """One or more tool-use questions could not produce a valid final answer."""
 
 
+class DecomposedRunError(RuntimeError):
+    """One or more decomposed questions could not produce a valid final answer."""
+
+
 @dataclass
 class _ToolUseResearchProgress:
     initial_search_completed: bool = False
@@ -2343,15 +2348,19 @@ def init_tool_use_clients() -> None:
     )
 
 
-async def run_tool_use_mode(args) -> None:
+async def run_tool_use_mode(args) -> list[str]:
     """Run the tool-use pipeline. Mirrors the historical dynamic_retriever.main()."""
+    if getattr(args, "question", None) is not None:
+        questions = [{"question_id": "cli", "question_text": args.question, "answer": ""}]
+    else:
+        questions = json.loads(Path(args.questions_path).read_text(encoding="utf-8-sig"))
+        if args.max_questions is not None:
+            questions = questions[: args.max_questions]
+
     init_tool_use_clients()
     cosmos_cfg = _tool_use_cosmos_cfg
     sources = cosmos_cfg["sources"]
 
-    questions = json.loads(Path(args.questions_path).read_text())
-    if args.max_questions is not None:
-        questions = questions[: args.max_questions]
     _log_line(f"Processing {len(questions)} questions", kind="info")
     t_main = _ck("tool-use main – start")
     use_rbac_auth = cosmos_cfg.get("use_rbac_auth", False)
@@ -2377,7 +2386,8 @@ async def run_tool_use_mode(args) -> None:
         out_root = Path(args.output_root)
         out = out_root / "standard" / f"results_{time.strftime('%Y%m%d_%H%M%S')}.json"
         out.parent.mkdir(parents=True, exist_ok=True)
-        for q in tqdm(questions):
+        question_iterator = questions if getattr(args, "answer_only", False) else tqdm(questions)
+        for q in question_iterator:
             results.append(await process_question(q, containers))
             checkpoint = out.with_suffix(".json.tmp")
             checkpoint.write_text(json.dumps(results, indent=2), encoding="utf-8")
@@ -2391,6 +2401,7 @@ async def run_tool_use_mode(args) -> None:
                 f"{len(failed)} question(s) failed: {', '.join(map(str, failed))}. "
                 f"Results, progress and errors were saved to {out}."
             )
+        return [r["answer"] for r in results]
     finally:
         await cosmos.close()
         if credential is not None:
@@ -2413,6 +2424,14 @@ def load_questions(path: Path) -> dict[str, list[Question]]:
     questions[path.stem] = [Question(q["question_id"], q["question_text"], path.stem, q.get("answer")) for q in data]
     return questions
 
+
+def _nonempty_question(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("--question must not be empty or whitespace-only")
+    return value
+
+
 async def main_async():
     """Top-level entry point. Parses CLI, loads config, and dispatches on mode."""
     # --- Phase 1: parse --config and --mode, then load configuration -------
@@ -2424,7 +2443,21 @@ async def main_async():
         default=None,
         help="Override pipeline.mode from config (default: tool-use if neither is set).",
     )
+    pre_parser.add_argument("--question", type=_nonempty_question)
+    pre_parser.add_argument("--answer-only", action="store_true")
     pre_args, _ = pre_parser.parse_known_args()
+
+    output_context = (
+        contextlib.redirect_stdout(sys.stderr)
+        if pre_args.answer_only else contextlib.nullcontext()
+    )
+    with output_context:
+        answers = await _dispatch_main(pre_args)
+    if pre_args.answer_only and answers:
+        print("\n\n".join(answers))
+
+
+async def _dispatch_main(pre_args: argparse.Namespace) -> list[str]:
     load_config(pre_args.config)
 
     pipeline_cfg = CONFIG.get("pipeline", {}) or {}
@@ -2442,12 +2475,11 @@ async def main_async():
         )
 
     if effective_mode == "tool-use":
-        await _run_tool_use_main(pre_args.config)
-    else:
-        await _run_decomposed_main(pre_args.config)
+        return await _run_tool_use_main(pre_args.config)
+    return await _run_decomposed_main(pre_args.config)
 
 
-async def _run_tool_use_main(config_path: Path) -> None:
+async def _run_tool_use_main(config_path: Path) -> list[str]:
     """CLI for tool-use mode (mirrors the historical dynamic_retriever.main())."""
     parser = argparse.ArgumentParser(
         description="dynamic_retriever.py (tool-use mode): LLM-driven function-calling RAG loop."
@@ -2463,8 +2495,12 @@ async def _run_tool_use_main(config_path: Path) -> None:
     )
     parser.add_argument(
         "--questions-path", type=Path,
-        default=Path(CONFIG["paths"]["questions_path"]),
+        default=CONFIG["paths"].get("questions_path"),
         help="Path to questions JSON",
+    )
+    parser.add_argument(
+        "--question", type=_nonempty_question,
+        help="Answer one question instead of reading --questions-path; ignores --max-questions",
     )
     parser.add_argument(
         "--output-root", type=Path,
@@ -2475,7 +2511,13 @@ async def _run_tool_use_main(config_path: Path) -> None:
         "--timing", action="store_true",
         help="Print timing checkpoints for each major operation",
     )
+    parser.add_argument(
+        "--answer-only", action="store_true",
+        help="Print only answers to stdout, send diagnostics to stderr, and disable progress bars",
+    )
     args = parser.parse_args()
+    if args.question is None and args.questions_path is None:
+        parser.error("--questions-path is required unless --question is supplied")
 
     global _TIMING, _t0
     _TIMING = args.timing
@@ -2483,10 +2525,10 @@ async def _run_tool_use_main(config_path: Path) -> None:
     if _TIMING:
         _log_line("Enabled: starts show total time; completions show +<step_elapsed>s (total <from_start>s)", kind="timing")
 
-    await run_tool_use_mode(args)
+    return await run_tool_use_mode(args)
 
 
-async def _run_decomposed_main(config_path: Path) -> None:
+async def _run_decomposed_main(config_path: Path) -> list[str]:
     """CLI for decomposed mode (mirrors the historical agentic_retriever.main_async())."""
     from utils.cosmos_retriever import CombinedRetriever, RETRIEVAL_SOURCES
 
@@ -2515,13 +2557,32 @@ async def _run_decomposed_main(config_path: Path) -> None:
     parser.add_argument("--rounds", type=int, default=pipeline_cfg.get("rounds", 2))
     parser.add_argument("--max-questions", type=int, default=CONFIG["execution"]["max_questions"])
     parser.add_argument("--max-workers", type=int, default=CONFIG["execution"]["max_workers"])
-    parser.add_argument("--questions-path", type=Path, default=Path(CONFIG["paths"]["questions_path"]))
+    parser.add_argument("--questions-path", type=Path, default=CONFIG["paths"].get("questions_path"))
+    parser.add_argument(
+        "--question", type=_nonempty_question,
+        help="Answer one question instead of reading --questions-path; ignores --max-questions",
+    )
     parser.add_argument("--output-root", type=Path, default=Path(CONFIG["paths"]["output_root"]))
     parser.add_argument("--timing", action="store_true", help="Print timing checkpoints for each major operation")
+    parser.add_argument(
+        "--answer-only", action="store_true",
+        help="Print only answers to stdout, send diagnostics to stderr, and disable progress bars",
+    )
     parser.add_argument("--cosmos-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Cosmos DB")
     parser.add_argument("--azure-az-login", action="store_true", help="Use 'az login' (AzureCliCredential) to authenticate to Azure OpenAI LLM")
     parser.add_argument("--separate-subq-calls", action="store_true", help="Use separate LLM calls per sub-question instead of the default efficient pipeline (`--efficient` has been removed)")
     args = parser.parse_args()
+    if args.question is None and args.questions_path is None:
+        parser.error("--questions-path is required unless --question is supplied")
+
+    if args.question is not None:
+        all_questions = [Question("cli", args.question, "cli", None)]
+        questions_by_file = {"cli": all_questions}
+    else:
+        questions_by_file = load_questions(args.questions_path)
+        all_questions = [q for qs in questions_by_file.values() for q in qs]
+        if args.max_questions:
+            all_questions = all_questions[:args.max_questions]
 
     global _TIMING, _t0
     _TIMING = args.timing
@@ -2561,11 +2622,6 @@ async def _run_decomposed_main(config_path: Path) -> None:
         args.subq_max_concurrency,
     )
     
-    questions_by_file = load_questions(args.questions_path)
-    # Flatten to a list for processing while keeping per-file association via q.group
-    all_questions: list[Question] = [q for qs in questions_by_file.values() for q in qs]
-    if args.max_questions:
-        all_questions = all_questions[:args.max_questions]
     _log_line(f"Processing {len(all_questions)} questions", kind="info")
     
     div_suffix = f"_div{args.k_diverse}" if args.k_diverse > 0 else ""
@@ -2574,6 +2630,8 @@ async def _run_decomposed_main(config_path: Path) -> None:
     output_path.mkdir(parents=True, exist_ok=True)
     
     results = []
+    ordered_results: dict[int, dict[str, Any]] = {}
+    failures: list[str] = []
 
     async def process(q: Question):
         token = _CURRENT_QUESTION_ID.set(q.question_id)
@@ -2584,6 +2642,10 @@ async def _run_decomposed_main(config_path: Path) -> None:
                 result = await pipeline.run_efficient(q.question_text)
         finally:
             _CURRENT_QUESTION_ID.reset(token)
+        if args.answer_only or args.question is not None:
+            answer = result.get("final_answer")
+            if not isinstance(answer, str) or not answer.strip():
+                raise ValueError(f"Question {q.question_id}: final answer must be a nonempty string")
         result["question_id"] = q.question_id
         result["question_text"] = q.question_text
         result["group"] = q.group
@@ -2597,19 +2659,22 @@ async def _run_decomposed_main(config_path: Path) -> None:
 
     semaphore = asyncio.Semaphore(max(1, args.max_workers))
 
-    async def bounded_process(q: Question):
+    async def bounded_process(index: int, q: Question):
         async with semaphore:
-            return await process(q)
+            return index, await process(q)
 
-    tasks = [asyncio.create_task(bounded_process(q)) for q in all_questions]
+    tasks = [asyncio.create_task(bounded_process(index, q)) for index, q in enumerate(all_questions)]
     try:
-        with tqdm(total=len(all_questions)) as pbar:
+        with tqdm(total=len(all_questions), disable=args.answer_only) as pbar:
             for task in asyncio.as_completed(tasks):
                 try:
-                    results.append(await task)
+                    index, result = await task
+                    results.append(result)
+                    ordered_results[index] = result
                 except RankerUnavailableError:
                     raise
                 except Exception as e:
+                    failures.append(str(e))
                     _log_line(f"Error: {e}", kind="error")
                 finally:
                     pbar.update(1)
@@ -2666,6 +2731,12 @@ async def _run_decomposed_main(config_path: Path) -> None:
 
     await retriever.close()
     await llm.close()
+    if failures and (args.answer_only or args.question is not None):
+        raise DecomposedRunError(
+            f"{len(failures)} question(s) failed. Completed results were saved to {output_path}. "
+            + "; ".join(failures)
+        )
+    return [ordered_results[index]["final_answer"] for index in sorted(ordered_results)]
 
 if __name__ == "__main__":
     # Ensure 'import dynamic_retriever' in other modules (e.g. utils.cosmos_retriever)
@@ -2706,7 +2777,7 @@ if __name__ == "__main__":
                 sys.stderr = _TeeStream(original_stderr, log_file)
                 try:
                     asyncio.run(main_async())
-                except (ServiceConnectionError, ConfigurationError, RankerUnavailableError, ToolUseRunError) as e:
+                except (ServiceConnectionError, ConfigurationError, RankerUnavailableError, ToolUseRunError, DecomposedRunError) as e:
                     sys.stdout = original_stdout
                     sys.stderr = original_stderr
                     print(f"\n\033[31mERROR: {e}\033[0m", file=sys.stderr)
@@ -2720,11 +2791,12 @@ if __name__ == "__main__":
                     sys.stderr = original_stderr
 
         shutil.copyfile(run_log_path, latest_log_path)
-        _log_line(f"wrote log: {run_log_path}", kind="warn")
-        _log_line(f"updated latest: {latest_log_path}", kind="warn")
+        with contextlib.redirect_stdout(sys.stderr):
+            _log_line(f"wrote log: {run_log_path}", kind="warn")
+            _log_line(f"updated latest: {latest_log_path}", kind="warn")
     else:
         try:
             asyncio.run(main_async())
-        except (ServiceConnectionError, ConfigurationError, RankerUnavailableError, ToolUseRunError) as e:
+        except (ServiceConnectionError, ConfigurationError, RankerUnavailableError, ToolUseRunError, DecomposedRunError) as e:
             print(f"\n\033[31mERROR: {e}\033[0m", file=sys.stderr)
             sys.exit(1)

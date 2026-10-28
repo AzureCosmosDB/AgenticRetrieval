@@ -333,6 +333,35 @@ python dynamic_retriever.py --config config.yaml --mode decomposed --rounds 2 --
 These commands use `paths.questions_path` and `paths.output_root`; override
 them with `--questions-path` and `--output-root` as needed.
 
+To answer one question without creating a questions file, use `--question`
+in either mode:
+
+```powershell
+python dynamic_retriever.py --config config.products.yaml --question "Hyaluronic acid face serum for oily skin?" --answer-only
+```
+
+`--question` takes precedence over `--questions-path` and ignores
+`--max-questions`, including limits set in the config. Surrounding whitespace
+is trimmed; empty or whitespace-only questions are rejected before clients
+are initialized. With this flag, `paths.questions_path` may be omitted.
+Single-question results use question ID `cli` (and group name `cli` in
+decomposed mode).
+
+`--answer-only` prints answer text to stdout, routes diagnostics (including
+warnings, errors and help) to stderr, and disables progress bars. It does not
+silence logging or change answer text encoding. It also works with question
+files: answers are printed in input order, separated by a blank line. Result
+files and checkpoints are still written. With `--timing`, diagnostics are
+still recorded in timing logs without contaminating answer-only stdout.
+For example, append `> answer.txt 2> diagnostics.txt` to separate the streams.
+On Windows consoles with encoding errors, set
+`$env:PYTHONIOENCODING = 'utf-8'` before running Python.
+
+Failed answer-only runs exit nonzero and do not print the final answer batch;
+completed results remain in their output files. Single-question decomposed
+runs also exit nonzero on processing failures rather than silently succeeding
+with no answer.
+
 `initial_search` executes at most once per question. `max_search_rounds` counts
 follow-up turns that request searches (parallel queries count as one turn);
 zero allows only initial retrieval before final synthesis. `max_agent_turns`
@@ -568,6 +597,8 @@ These flags override the corresponding `config.yaml` values for a single run (de
 - `--max-questions` — only answer the first N questions from the questions file (both modes; handy for smoke tests).
 - `--max-workers` — number of questions processed concurrently.
 - `--questions-path` — path to the questions `.json` file (both modes; overrides `paths.questions_path`).
+- `--question` — answer a single nonempty question instead of reading a questions file (both modes; ignores `--max-questions`).
+- `--answer-only` — print only answers to stdout, route diagnostics to stderr, and disable progress bars (both modes).
 - `--output-root` — directory where traces and answer files are written (both modes; overrides `paths.output_root`).
 
 Tool-use search/turn budgets are YAML settings, not CLI flags. `--timing` is
