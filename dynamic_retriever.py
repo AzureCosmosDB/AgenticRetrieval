@@ -1336,6 +1336,7 @@ _tool_use_r_fail: bool = False
 _tool_use_r_bs: int = 16
 _tool_use_r_mr: int = 5
 _tool_use_query_template: str = ""
+_tool_use_reasoning_disabled: set[tuple[str, str]] = set()
 
 _TIKTOKEN_ENC = tiktoken.get_encoding("o200k_base")
 
@@ -1346,6 +1347,44 @@ class ToolUseRunError(RuntimeError):
 
 class DecomposedRunError(RuntimeError):
     """One or more decomposed questions could not produce a valid final answer."""
+
+
+async def tool_use_chat_completion(
+    *, model: str, **kwargs: Any,
+) -> openai.types.chat.ChatCompletion:
+    if _tool_use_llm is None:
+        raise RuntimeError("Tool-use LLM client is not initialized; call init_tool_use_clients first")
+    key = (str(_tool_use_llm_cfg.get("llm_endpoint", "")), model)
+    if key in _tool_use_reasoning_disabled:
+        kwargs["reasoning_effort"] = "none"
+    try:
+        return await _tool_use_llm.chat.completions.create(model=model, stream=False, **kwargs)
+    except oai.BadRequestError as error:
+        body = error.body
+        if isinstance(body, dict):
+            body = body.get("error", body)
+        message = body.get("message", "") if isinstance(body, dict) else str(error)
+        message = str(message).lower()
+        if (
+            not kwargs.get("tools")
+            or kwargs.get("reasoning_effort") == "none"
+            or "function tools with reasoning_effort are not supported" not in message
+            or "/v1/chat/completions" not in message
+            or "use /v1/responses" not in message
+            or not re.search(r"""set reasoning_effort to ['"]none['"]""", message)
+        ):
+            raise
+        if key not in _tool_use_reasoning_disabled:
+            _tool_use_reasoning_disabled.add(key)
+            _log_line(
+                f"Model {model!r} rejected reasoning with function tools on Chat Completions. "
+                "Retrying with reasoning_effort='none' for this endpoint/model for the rest "
+                "of this execution; reasoning is disabled and configuration is unchanged. "
+                "Use the /responses API for tool calling with reasoning enabled.",
+                kind="warn",
+            )
+        kwargs["reasoning_effort"] = "none"
+        return await _tool_use_llm.chat.completions.create(model=model, stream=False, **kwargs)
 
 
 @dataclass
@@ -1448,7 +1487,7 @@ def _validate_tool_use_answer_audit(
 async def _audit_tool_use_answer(
     question: str, answer: str, documents: dict[str, str],
 ) -> list[dict[str, Any]]:
-    response = await _tool_use_llm.chat.completions.create(
+    response = await tool_use_chat_completion(
         model=_tool_use_llm_cfg["llm_model"],
         messages=[
             {"role": "system", "content": (
@@ -1689,7 +1728,7 @@ async def tool_use_hyde_passage(query: str) -> str:
     for attempt in range(1, _tool_use_max_retries + 1):
         try:
             t = _ck("LLM HyDE – start")
-            r = await _tool_use_llm.chat.completions.create(
+            r = await tool_use_chat_completion(
                 model=_tool_use_llm_cfg["llm_model"],
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
@@ -1960,7 +1999,7 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
             pending_calls = []
             try:
                 t_step = _ck("LLM final synthesis – start")
-                response = await _tool_use_llm.chat.completions.create(
+                response = await tool_use_chat_completion(
                     model=_tool_use_llm_cfg["llm_model"], messages=msgs,
                     tools=[tool for tool in tools if tool["function"]["name"] == "final_answer"],
                     tool_choice={"type": "function", "function": {"name": "final_answer"}},
@@ -2015,7 +2054,7 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                 if (tool["function"]["name"] != "initial_search")
                 == progress.initial_search_completed
             ]
-            r = await _tool_use_llm.chat.completions.create(
+            r = await tool_use_chat_completion(
                 model=_tool_use_llm_cfg["llm_model"],
                 messages=msgs,
                 tools=available_tools,
@@ -2158,7 +2197,7 @@ async def _process_question_inner(q_obj, containers, query, qid, t0, t_run):
                 gap_msgs.append({"role": "user", "content": "Based on the retrieved documents above and the original question, identify specific information gaps that are not covered and need to be addressed. Return a concise numbered list of missing pieces of information."})
                 try:
                     t_gap = _ck("LLM find_gaps – start")
-                    gap_r = await _tool_use_llm.chat.completions.create(
+                    gap_r = await tool_use_chat_completion(
                         model=_tool_use_llm_cfg["llm_model"],
                         messages=gap_msgs,
                         temperature=_tool_use_llm_cfg.get("temperature", 0),
@@ -2267,6 +2306,7 @@ def init_tool_use_clients() -> None:
     global _tool_use_r_http, _tool_use_r_url, _tool_use_r_tok, _tool_use_r_bs, _tool_use_r_mr, _tool_use_r_fail
     global _tool_use_query_template
 
+    _tool_use_reasoning_disabled.clear()
     cfg = CONFIG
     _tool_use_max_search_rounds, _tool_use_max_agent_turns = _tool_use_research_limits(
         cfg.get("pipeline") or {},

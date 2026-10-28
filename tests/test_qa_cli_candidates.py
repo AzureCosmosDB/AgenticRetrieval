@@ -53,6 +53,7 @@ def test_sample_materializes_partition_aware_vector_candidates(strategy):
     dr = SimpleNamespace(
         tool_use_embed=AsyncMock(return_value=[0.1]), tool_use_vec_search=search,
         tool_use_fmt=lambda doc: doc["title"],
+        tool_use_chat_completion=create,
         _tool_use_source_cfg={"products": {"search_k": 2}},
         _tool_use_source_embed={"products": "e"},
         _tool_use_source_partition={"products": "/identity/upc"},

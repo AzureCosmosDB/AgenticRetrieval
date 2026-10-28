@@ -50,6 +50,7 @@ def agent(monkeypatch):
     scripted = []
     validation_requests = []
     audits = []
+    monkeypatch.setattr(dr, "_tool_use_reasoning_disabled", set())
     monkeypatch.setattr(dr, "_tool_use_query_template", "Original question: {question}. initial_search first.")
     monkeypatch.setattr(dr, "_tool_use_context_fields", [])
     monkeypatch.setattr(dr, "_tool_use_max_search_rounds", 2)
@@ -108,6 +109,67 @@ def agent(monkeypatch):
         run=run, requests=requests, search=search_mock,
         audits=audits, validation_requests=validation_requests,
     )
+
+
+@pytest.mark.parametrize("stage", ["agent", "forced", "audit", "gap"])
+def test_reasoning_tool_error_recovers_on_every_tool_use_request_path(agent, monkeypatch, stage):
+    monkeypatch.setattr(dr, "_tool_use_max_retries", 1)
+    error = openai.BadRequestError(
+        "Function tools with reasoning_effort are not supported for gpt-6-luna in "
+        "/v1/chat/completions. To use function tools, use /v1/responses or set "
+        "reasoning_effort to 'none'.",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://example.invalid")),
+        body=None,
+    )
+    initial = response(("initial_search", {}))
+    final = response(("final_answer", {"answer": "Supported facts; stock is unverified."}))
+    items = [initial, final]
+    if stage == "agent":
+        items.insert(0, error)
+    elif stage == "forced":
+        monkeypatch.setattr(dr, "_tool_use_max_search_rounds", 0)
+        items.insert(1, error)
+    elif stage == "audit":
+        agent.audits.extend([error, {"substantive": True, "issues": [], "items": []}])
+    else:
+        items = [
+            error, initial, response(("find_information_gaps", {})),
+            response(content="Retailer stock remains unverified."), final,
+        ]
+
+    result = agent.run(*items)
+
+    assert result["status"] == "completed"
+    assert result["tool_calls"]["initial_search"] == 1
+    requests = agent.validation_requests if stage == "audit" else agent.requests
+    assert any(request.get("reasoning_effort") == "none" for request in requests)
+    assert agent.validation_requests[-1]["reasoning_effort"] == "none"
+    if stage == "gap":
+        assert next(
+            request for request in agent.requests if "tools" not in request
+        )["reasoning_effort"] == "none"
+
+
+def test_reasoning_override_survives_later_questions_in_same_execution(agent):
+    error = openai.BadRequestError(
+        "Function tools with reasoning_effort are not supported for gpt-6-luna in "
+        "/v1/chat/completions. To use function tools, use /v1/responses or set "
+        "reasoning_effort to 'none'.",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://example.invalid")),
+        body=None,
+    )
+    initial = response(("initial_search", {}))
+    final = response(("final_answer", {"answer": "Available evidence; stock is unverified."}))
+    config = copy.deepcopy(dr._tool_use_llm_cfg)
+
+    assert agent.run(error, initial, final)["status"] == "completed"
+    previous_requests = len(agent.requests)
+    assert agent.run(initial, final)["status"] == "completed"
+
+    assert all(
+        request["reasoning_effort"] == "none" for request in agent.requests[previous_requests:]
+    )
+    assert dr._tool_use_llm_cfg == config
 
 
 @pytest.mark.parametrize("path", ["model", "tool", "forced"])

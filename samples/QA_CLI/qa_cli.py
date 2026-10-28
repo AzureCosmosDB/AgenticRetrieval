@@ -470,7 +470,7 @@ class VectorSearchAnswerer:
             f"Context documents:\n{context}\n\n"
             f"Question: {question}\n\nAnswer:"
         )
-        r = await dr._tool_use_llm.chat.completions.create(
+        r = await dr.tool_use_chat_completion(
             model=dr._tool_use_llm_cfg["llm_model"],
             messages=[
                 {"role": "system", "content": _VECTOR_SYSTEM_PROMPT},

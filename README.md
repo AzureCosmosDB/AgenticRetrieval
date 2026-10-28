@@ -347,6 +347,37 @@ are initialized. With this flag, `paths.questions_path` may be omitted.
 Single-question results use question ID `cli` (and group name `cli` in
 decomposed mode).
 
+#### Reasoning models and tool calling
+
+For reasoning with function tools, use the
+[/responses API](https://learn.microsoft.com/azure/foundry/openai/how-to/reasoning#tool-calling-with-reasoning-models).
+Microsoft documents that GPT-5.6 and later models cannot combine reasoning
+with function tools on Chat Completions unless `reasoning_effort` is `none`.
+Omitting the parameter can still fail because the model may enable reasoning
+by default. This is model-specific; do not set `none` universally.
+
+The current `--mode tool-use` implementation uses Chat Completions, not
+Responses. Changing an endpoint string or a YAML comment to `/responses`
+does not migrate the request/response format; there is no Responses API
+switch in the current configuration.
+
+For compatibility, if the service returns the specific HTTP 400 error
+`Function tools with reasoning_effort are not supported ...` and explicitly
+instructs the caller to use `/v1/responses` or `reasoning_effort='none'`, the
+runtime logs a warning and immediately retries once with `reasoning_effort`
+set to `"none"`. It remembers that override for the affected endpoint and
+deployment for the rest of the execution, including later questions, final
+synthesis, answer audits, and other calls sharing the tool-use client.
+Client reinitialization clears the override. Neither the YAML file nor the
+in-memory configuration is modified.
+
+This fallback disables model reasoning and can reduce planning quality; it
+does not remove tools or bypass answer validation. Other errors retain their
+existing handling, and a failed compatibility retry is not silently accepted.
+Use a Responses-based integration when reasoning must remain enabled.
+
+#### Answer-only output
+
 `--answer-only` prints answer text to stdout, routes diagnostics (including
 warnings, errors and help) to stderr, and disables progress bars. It does not
 silence logging or change answer text encoding. It also works with question
